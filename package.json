@@ -1,0 +1,22 @@
+{
+  "name": "stock-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Live Trading Display Dashboard Monorepo",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build:shared": "npm run build -w packages/shared",
+    "dev:backend": "npm run dev -w apps/backend",
+    "dev:frontend": "npm run dev -w apps/frontend",
+    "install:all": "npm install"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "resend": "^6.12.4"
+  }
+}

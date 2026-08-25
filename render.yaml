@@ -1,0 +1,180 @@
+# render.yaml — Render Infrastructure-as-Code for TradePro backend
+# Docs: https://render.com/docs/blueprint-spec
+#
+# HOW TO USE:
+#   1. Push this repo to GitHub / GitLab.
+#   2. Render dashboard → New → Blueprint → connect the repo.
+#   3. Fill in every `sync: false` value in the Render "Environment" panel
+#      before the first deploy.
+#
+# MONOREPO NOTE:
+#   rootDir is intentionally the repo root (not apps/backend) so that
+#   npm workspaces can install and link @stock/shared before compilation.
+
+services:
+  - type: web
+    name: tradepro-backend
+    runtime: node
+    region: oregon
+
+    # Build: install all workspace deps → compile shared → compile backend.
+    # Render runs this from the repo root.
+    buildCommand: npm install && npm run build:shared && npm run build -w apps/backend
+
+    # Start the compiled output directly. dotenv finds no .env on Render
+    # (env vars come from the dashboard), which is the correct behaviour.
+    startCommand: node apps/backend/dist/server.js
+
+    # Render performs a GET on this path after deploy to verify the service is up.
+    healthCheckPath: /health
+
+    # Trigger deploys manually or via GitHub push — change to true for CD.
+    autoDeploy: false
+
+    envVars:
+
+      # ── Runtime ─────────────────────────────────────────────────────────────
+      - key: NODE_VERSION
+        value: "22"
+
+      - key: NODE_ENV
+        value: production
+
+      # Render assigns PORT automatically (default 10000).
+      # The app reads process.env.PORT || 5001, so this is fine either way.
+      - key: PORT
+        value: "10000"
+
+      # ── Authentication ────────────────────────────────────────────────────────
+      # generateValue: true — Render creates a cryptographically secure random value
+      # on first deploy. Copy it to JWT_REFRESH_SECRET as well (keep them different).
+      - key: JWT_SECRET
+        generateValue: true
+
+      - key: JWT_REFRESH_SECRET
+        generateValue: true
+
+      # ── Database ──────────────────────────────────────────────────────────────
+      # MongoDB Atlas free-tier cluster works well. Format:
+      # mongodb+srv://<user>:<pass>@cluster.mongodb.net/<db>?retryWrites=true&w=majority
+      - key: MONGODB_URI
+        sync: false
+
+      # ── Redis — Upstash (no server to manage, HTTP-based) ────────────────────
+      # Create a free Upstash database at https://console.upstash.com
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
+
+      # ── CORS / Frontend ───────────────────────────────────────────────────────
+      # REQUIRED. Set to your deployed frontend URL, e.g.:
+      # https://your-app.vercel.app
+      # Without this, Socket.IO credentialed connections will be rejected by browsers.
+      - key: FRONTEND_URL
+        sync: false
+
+      # ── Email ─────────────────────────────────────────────────────────────────
+      - key: RESEND_API_KEY
+        sync: false
+
+      # ── Zebu Broker — Module 1 ────────────────────────────────────────────────
+      - key: ZEBU_CLIENT_ID
+        sync: false
+
+      - key: ZEBU_USER_ID
+        sync: false
+
+      - key: ZEBU_ACCOUNT_ID
+        sync: false
+
+      - key: ZEBU_VENDOR_CODE
+        sync: false
+
+      - key: ZEBU_PASSWORD
+        sync: false
+
+      - key: ZEBU_FACTOR2
+        sync: false
+
+      - key: ZEBU_IMEI
+        value: abc1234
+
+      - key: MOD1_API_KEY
+        sync: false
+
+      - key: MOD1_API_SECRET
+        sync: false
+
+      # NIFTY instrument tokens — update every Thursday after weekly expiry.
+      # Download https://go.mynt.in/NFO_symbols.txt to find current token numbers.
+      - key: ZEBU_NIFTY_FUT_TOKEN
+        sync: false
+
+      - key: ZEBU_NIFTY_CE_TOKENS
+        sync: false
+
+      - key: ZEBU_NIFTY_PE_TOKENS
+        sync: false
+
+      # Zebu static endpoints (public, not secrets — baked in for convenience)
+      - key: ZEBU_WS_URL
+        value: wss://go.mynt.in/NorenWS/
+
+      - key: ZEBU_REST_BASE_URL
+        value: https://go.mynt.in
+
+      - key: ZEBU_LOGIN_URL
+        value: https://go.mynt.in/NorenWClientTP/QuickAuth
+
+      - key: ZEBU_QUOTES_URL
+        value: https://go.mynt.in/NorenWClientTP/GetQuotes
+
+      - key: ZEBU_SOURCE
+        value: API
+
+      # Zebu OAuth (optional — only needed if using OAuth flow, not QuickAuth)
+      - key: ZEBU_REDIRECT_URL
+        sync: false
+        # Set to: https://<your-render-service>.onrender.com/api/module1/zebu/oauth/callback
+
+      - key: ZEBU_OAUTH_AUTHORIZE_URL
+        value: https://go.mynt.in/OAuthlogin/authorize/oauth
+
+      - key: ZEBU_OAUTH_TOKEN_URL
+        value: https://go.mynt.in/NorenWClientAPI/GenAcsTok
+
+      # ── Aetram Broker — Module 2 ──────────────────────────────────────────────
+      - key: MOD2_API_KEY
+        sync: false
+
+      - key: MOD2_API_SECRET
+        sync: false
+
+      - key: AETRAM_APP_KEY
+        sync: false
+
+      - key: AETRAM_SECRET_KEY
+        sync: false
+
+      - key: MOD2_INTERACTIVE_API_KEY
+        sync: false
+
+      - key: MOD2_INTERACTIVE_API_SECRET
+        sync: false
+
+      - key: AETRAM_MARKETDATA_AUTH_URL
+        value: https://secure.aetramtrades.in/apimarketdata/auth/login
+
+      - key: AETRAM_MARKETDATA_API_BASE_URL
+        value: https://secure.aetramtrades.in/apimarketdata
+
+      - key: AETRAM_INTERACTIVE_AUTH_URL
+        value: https://developers.symphonyfintech.in/1interactive/user/session
+
+      - key: AETRAM_INTERACTIVE_API_BASE_URL
+        value: https://developers.symphonyfintech.in/1interactive
+
+      - key: AETRAM_INTERACTIVE_HOSTLOOKUP_URL
+        value: https://developers.symphonyfintech.in/hostlookup

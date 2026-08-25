@@ -1,0 +1,8 @@
+node_modules
+.env
+.DS_Store
+
+# Compiled TypeScript output — never commit build artifacts.
+# If dist/ is already tracked, run: git rm -r --cached apps/backend/dist packages/shared/dist
+dist/
+*.js.map
