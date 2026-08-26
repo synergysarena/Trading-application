@@ -84,7 +84,7 @@ const io = new Server(server, {
   cors: corsOptions,
   transports: ["websocket", "polling"],
   pingInterval: 25000,
-  pingTimeout:  60000,
+  pingTimeout: 60000,
 });
 
 // Security & utility middlewares
@@ -281,7 +281,7 @@ const startServer = async () => {
     // One-time hygiene: stamp the 25h TTL on legacy no-TTL market keys so the
     // pre-existing key space converges to the same daily lifecycle as MongoDB.
     // Guarded by a marker key — runs once, not on every deploy.
-    void sweepLegacyMarketKeys().catch(() => {});
+    void sweepLegacyMarketKeys().catch(() => { });
   } catch (error) {
     if (process.env.NODE_ENV === "production") {
       // Redis uses an in-memory fallback (see config/redis.ts) — log but continue.
@@ -376,7 +376,7 @@ const shutdown = (signal: string) => {
       const mongoose = require("mongoose");
       await mongoose.connection.close();
       console.log("[Server] MongoDB connection closed.");
-    } catch {}
+    } catch { }
     console.log("[Server] Shutdown complete.");
     process.exit(0);
   });
@@ -389,6 +389,6 @@ const shutdown = (signal: string) => {
 };
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT",  () => shutdown("SIGINT"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 
 export { app, server, io };
