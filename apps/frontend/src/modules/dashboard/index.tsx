@@ -18,7 +18,7 @@ import {
 import type { TmaState } from "../../calc";
 import { formatExpiryForBroker } from "../../data/models";
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// -- Helpers -------------------------------------------------------------------
 
 function tfToMs(tf: string): number {
   if (tf.endsWith("h")) return parseInt(tf, 10) * 60 * 60 * 1000;
@@ -26,9 +26,7 @@ function tfToMs(tf: string): number {
   return 5 * 60 * 1000;
 }
 
-// Sentinel for a bar with no data — p0(NaN) renders "—" and NaN propagates
-// cleanly through mmaBar (and is skipped by tmaAccumulate/tmaValue) without
-// polluting neighbouring values.
+// Sentinel for a bar with no data
 const MISSING_BAR = (t: number): OHLCBar => ({ t, o: NaN, h: NaN, l: NaN, c: NaN });
 
 function normalizeBar(raw: any): OHLCBar | null {
@@ -54,14 +52,11 @@ interface ActiveBar {
   putO:  number; putH:  number; putL:  number; putC:  number;
   futO:  number; futH:  number; futL:  number; futC:  number;
   spotO: number; spotH: number; spotL: number; spotC: number;
-  // Cumulative traded volume for the Future contract so far within this
-  // forming bar — polled from the backend's active-candle tracker (the
-  // authoritative accumulator), not re-derived from raw ticks on the client.
   futVolume: number;
   windowStart: number;
 }
 
-// ── StatusPanel ───────────────────────────────────────────────────────────────
+// -- StatusPanel ---------------------------------------------------------------
 
 const STATUS_CONFIGS: Partial<Record<FeedStatus | "custom-pending", {
   icon: string; title: string; message: string; color: string; showRetry?: boolean;
@@ -168,7 +163,7 @@ function StatusPanel({ status, onRetry }: { status: string; onRetry?: () => void
   );
 }
 
-// ── InfoBar ───────────────────────────────────────────────────────────────────
+// -- InfoBar -------------------------------------------------------------------
 
 function InfoBar() {
   const { pivotMethod, setPivotMethod } = useDashStore();
@@ -197,7 +192,7 @@ function InfoBar() {
 
       <div style={{ flex: 1 }} />
 
-      {/* PP / 4-Bar / Classic toggle — now drives the Pivot Point (PP/R1-R3/S1-S3) worksheet columns */}
+      {/* PP / 4-Bar / Classic toggle */}
       <div style={{
         display: "flex", alignItems: "center", gap: 4,
         padding: "0 16px", borderLeft: "1px solid rgba(255,255,255,0.1)",
@@ -226,7 +221,7 @@ function InfoBar() {
   );
 }
 
-// ── Dashboard ────────────────────────────────────────────────────────────────
+// -- Dashboard ----------------------------------------------------------------
 
 export function Dashboard() {
   const {
@@ -250,16 +245,10 @@ export function Dashboard() {
   const prevOiTin     = useRef<number>(-1);
   const prevEmaRef    = useRef<number | null>(null);
   const prevEma200Ref = useRef<number | null>(null);
-  // True-VWAP running state: Σ(TP×Volume) and ΣVolume over Future bars.
   const vwapStateRef  = useRef<{ cumTPV: number; cumV: number }>({ cumTPV: 0, cumV: 0 });
-  // TMA running state per side: Σ(O+H+L+C) and bar count over CLOSED bars
-  // only — the forming bar's contribution is recomputed every tick via
-  // tmaValue(state, formingBar) and folded in once its window closes.
   const tmaStatesRef  = useRef<{ call: TmaState; put: TmaState; fut: TmaState; spot: TmaState }>({
     call: newTmaState(), put: newTmaState(), fut: newTmaState(), spot: newTmaState(),
   });
-  // Latest polled cumulative volume for the Future contract's forming bar
-  // (see the getFuturesData poll in Effect 2) — read synchronously each tick.
   const liveFutVolumeRef = useRef<number>(0);
 
   // M-4: Rehydrate user-scoped preferences on login
@@ -306,20 +295,27 @@ export function Dashboard() {
       clearRows();
       setIsLoading(true);
       setFeedStatus("connecting");
+      console.log("[Module1/Data] Initializing Dashboard data load...");
 
       try {
         // 1. Market status check
         if (timeframe !== "custom") {
-          const status = await api.get("/api/market/status");
+          const status = await api.get("/api/market/status").catch(() => null);
           if (cancelled) return;
 
           if (status?.status === "CLOSED") {
             setFeedStatus("market-closed");
-          } else if (!status?.zebuConnected) {
+          } else if (status && !status.zebuConnected) {
             const m1Status = useStore.getState().module1Status;
-            setFeedStatus(m1Status === "authenticated" ? "api-error" : "auth-error");
-            setIsLoading(false);
-            return;
+            if (m1Status !== "authenticated" && m1Status !== "authenticating") {
+              setFeedStatus("auth-error");
+              setIsLoading(false);
+              return;
+            }
+            // If authenticated, do not immediately show fatal api-error;
+            // keep status as connecting and proceed with history load + live wait.
+            console.log("[Module1/Data] Broker connecting on startup — proceeding with history load & live wait");
+            setFeedStatus("connecting");
           }
         }
 
@@ -334,28 +330,42 @@ export function Dashboard() {
           futUrl = `/api/market/ohlc/${futSym}/${timeframe}`;
         }
 
-        // 3. C-1: Derive option symbols from store config.
+        // 3. Derive option symbols from store config
         const expiryFmt = formatExpiryForBroker(expiryDate);
         const includesCall = type === "Call" || type === "Call+Put";
         const includesPut  = type === "Put"  || type === "Call+Put";
         const ceSymbol = (expiryFmt && includesCall && callStrike) ? `${instrument}${expiryFmt}C${callStrike}` : null;
         const peSymbol = (expiryFmt && includesPut  && putStrike)  ? `${instrument}${expiryFmt}P${putStrike}`  : null;
 
-        // 4. Fetch all OHLC series in parallel (futures required; options + spot best-effort)
+        // 4. Fetch all OHLC series in parallel with bounded retry for transient network glitches
         const tf = timeframe === "custom" ? customRange!.candleTf : timeframe;
+
+        console.log("[Module1/Data] Loading history from API...");
+
+        const fetchWithRetry = async <T,>(fn: () => Promise<T>, maxAttempts = 3, initialDelay = 500): Promise<T | null> => {
+          let delay = initialDelay;
+          for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+              if (cancelled) return null;
+              return await fn();
+            } catch (err) {
+              if (attempt === maxAttempts || cancelled) return null;
+              await new Promise((res) => setTimeout(res, delay));
+              delay *= 2;
+            }
+          }
+          return null;
+        };
+
         const [rawFut, rawCe, rawPe, rawSpot, rawSpotWarmup] = await Promise.all([
-          api.get(futUrl).catch(() => null),
-          ceSymbol ? api.get(`/api/market/ohlc/${ceSymbol}/${tf}`).catch(() => null) : Promise.resolve(null),
-          peSymbol ? api.get(`/api/market/ohlc/${peSymbol}/${tf}`).catch(() => null)  : Promise.resolve(null),
-          // M-5: fetch NIFTY-SPOT OHLC for accurate historical spot column
+          fetchWithRetry(() => api.get(futUrl)),
+          ceSymbol ? fetchWithRetry(() => api.get(`/api/market/ohlc/${ceSymbol}/${tf}`)) : Promise.resolve(null),
+          peSymbol ? fetchWithRetry(() => api.get(`/api/market/ohlc/${peSymbol}/${tf}`)) : Promise.resolve(null),
           timeframe !== "custom"
-            ? api.get(`/api/market/ohlc/NIFTY-SPOT/${tf}`).catch(() => null)
+            ? fetchWithRetry(() => api.get(`/api/market/ohlc/NIFTY-SPOT/${tf}`))
             : Promise.resolve(null),
-          // EMA200 warm-up: prior-session Spot candles (best-effort — 45-day
-          // retention may not cover a full 200 bars on coarser timeframes; see
-          // getWarmupOHLCBars). Not shown as rows — seed data only.
           timeframe !== "custom"
-            ? api.get(`/api/market/ohlc-warmup/NIFTY-SPOT/${tf}?count=200`).catch(() => null)
+            ? fetchWithRetry(() => api.get(`/api/market/ohlc-warmup/NIFTY-SPOT/${tf}?count=200`))
             : Promise.resolve(null),
         ]);
 
@@ -368,7 +378,7 @@ export function Dashboard() {
 
         const ceMap   = new Map<number, OHLCBar>();
         const peMap   = new Map<number, OHLCBar>();
-        const spotMap = new Map<number, OHLCBar>(); // t → full Spot OHLC bar
+        const spotMap = new Map<number, OHLCBar>();
 
         if (Array.isArray(rawCe)) {
           rawCe.forEach(r => { const b = normalizeBar(r); if (b) ceMap.set(b.t, b); });
@@ -380,8 +390,6 @@ export function Dashboard() {
           rawSpot.forEach(r => { const b = normalizeBar(r); if (b) spotMap.set(b.t, b); });
         }
 
-        // EMA200/EMA20 warm-up closes — prior-session Spot bars, oldest first.
-        // Indicator seed data only: never turned into worksheet rows.
         const spotWarmupCloses: number[] = Array.isArray(rawSpotWarmup)
           ? (rawSpotWarmup.map(normalizeBar).filter(Boolean) as OHLCBar[])
               .sort((a, b) => a.t - b.t)
@@ -390,12 +398,6 @@ export function Dashboard() {
 
         if (process.env.NODE_ENV === "development" && (ceMap.size > 0 || peMap.size > 0)) {
           console.log(`[C-1] Option OHLC loaded — CE bars: ${ceMap.size} PE bars: ${peMap.size} Spot bars: ${spotMap.size}`);
-        }
-        if (process.env.NODE_ENV === "development" && ceSymbol && ceMap.size === 0) {
-          console.warn(`[C-1] CE OHLC empty for ${ceSymbol} — Call rows will show "—". Check: (a) strike within ATM±1000, (b) option ticks hitting aggregateOHLC in dataFeed.ts`);
-        }
-        if (process.env.NODE_ENV === "development" && peSymbol && peMap.size === 0) {
-          console.warn(`[C-1] PE OHLC empty for ${peSymbol} — Put rows will show "—". Check: (a) strike within ATM±1000, (b) option ticks hitting aggregateOHLC in dataFeed.ts`);
         }
 
         // 6. Client-side session filter for live mode
@@ -418,10 +420,6 @@ export function Dashboard() {
           ? futBars
           : futBars.filter(b => b.t < liveWindowStart);
 
-        // Seed EMA20/EMA200 continuation from warm-up alone so a value exists
-        // even before today's first bar closes (client requirement: EMA200
-        // available immediately after market open). Overwritten below with the
-        // fuller warm-up+today series once today has at least one closed bar.
         if (spotWarmupCloses.length > 0) {
           const warmupEma    = computeEMASeries(spotWarmupCloses, 20);
           const warmupEma200 = computeEMASeries(spotWarmupCloses, 200);
@@ -435,9 +433,6 @@ export function Dashboard() {
           const spotBarsForCalc = closedBars.map(b => spotMap.get(b.t) ?? b);
           const spotCloses      = spotBarsForCalc.map(sb => sb.c);
 
-          // EMA20 / EMA200: seed with prior-session warm-up closes, then
-          // continue through today's closes — only today's index range
-          // (sliced off after warmupLen) becomes worksheet rows.
           const warmupLen       = spotWarmupCloses.length;
           const combinedCloses  = [...spotWarmupCloses, ...spotCloses];
           const emaSeriesAll    = computeEMASeries(combinedCloses, 20);
@@ -445,11 +440,8 @@ export function Dashboard() {
           const emaSeries       = emaSeriesAll.slice(warmupLen);
           const emaSeries200    = emaSeries200All.slice(warmupLen);
 
-          // True VWAP: Σ(TP×Volume)/ΣVolume over today's Future bars only —
-          // VWAP is session-cumulative and resets every day, so no warm-up.
           const vwapSeries      = computeVWAPSeries(closedBars);
 
-          // Seed live-bar EMA / EMA200 / VWAP continuation state
           prevEmaRef.current = emaSeriesAll[emaSeriesAll.length - 1] ?? null;
           prevEma200Ref.current = emaSeries200All[emaSeries200All.length - 1] ?? null;
           let cumTPVForState = 0;
@@ -474,7 +466,6 @@ export function Dashboard() {
             const pdh = i === 0 ? bar.h : prevH;
             const pdl = i === 0 ? bar.l : prevL;
 
-            // No cross-instrument fallback: a row with no CE/PE bar renders "—".
             const callBar: OHLCBar = ceMap.get(bar.t) ?? MISSING_BAR(bar.t);
             const putBar:  OHLCBar = peMap.get(bar.t) ?? MISSING_BAR(bar.t);
             const spotBar: OHLCBar = spotMap.get(bar.t) ?? bar;
@@ -483,9 +474,6 @@ export function Dashboard() {
             const pMMA = mmaBar(putBar);
             const fMMA = mmaBar(bar);
             const sMMA = mmaBar(spotBar);
-            // TMA is cumulative — fold this closed bar into each side's
-            // running Σ(O+H+L+C)/count state, then read the value. The same
-            // state carries straight into the live-bar continuation below.
             const tma = tmaStatesRef.current;
             tmaAccumulate(tma.call, callBar);
             tmaAccumulate(tma.put,  putBar);
@@ -537,7 +525,7 @@ export function Dashboard() {
           setLivePrices(lastSpotBar.c, last.c);
 
           console.log(
-            `[Dashboard] History loaded: ${closedBars.length} closed bars | ` +
+            `[Module1/Data] History loaded: ${closedBars.length} closed bars | ` +
             `sessionHigh=${sessionHigh} sessionLow=${sessionLow} | last bar t=${last.t}`
           );
         }
@@ -565,25 +553,21 @@ export function Dashboard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isGenerated, instrument, timeframe, customRange, reloadKey, generateKey, expiryDate, callStrike, putStrike, type]);
 
-  // Effect 1b: automatic recovery from a stuck error state — no user interaction.
-  //
-  // Effect 1 above makes a single point-in-time judgement (one REST call to
-  // /api/market/status, or whatever exception a fetch throws) at the moment
-  // Generate fires. That snapshot can be wrong for reasons that are already
-  // transient by the time the user sees it: the broker finished connecting a
-  // moment after the check ran, a network blip had already recovered, etc.
-  // Previously the ONLY way out of api-error/auth-error/no-network was the
-  // manual Retry button. This mirrors that exact same action (bumpReloadKey,
-  // which re-runs Effect 1's full history fetch + live-bar rebuild) on a
-  // short timer so the dashboard heals itself. market-closed gets the same
-  // treatment on a longer interval purely so a tab left open across the
-  // 9:00 AM open transitions on its own (see "Long-running dashboard" /
-  // "Market open" acceptance scenarios) — it never touches formulas/UI.
+  // Effect 1b: automatic recovery from a stuck error state
   useEffect(() => {
     if (!isGenerated) return;
 
-    if (feedStatus === "api-error" || feedStatus === "auth-error" || feedStatus === "no-network") {
-      const t = setInterval(() => bumpReloadKey(), 5000);
+    if (
+      feedStatus === "api-error" ||
+      feedStatus === "auth-error" ||
+      feedStatus === "no-network" ||
+      feedStatus === "broker-disconnected" ||
+      feedStatus === "reconnecting"
+    ) {
+      const t = setInterval(() => {
+        console.log(`[Module1/Data] Auto-recovering from ${feedStatus}...`);
+        bumpReloadKey();
+      }, 5000);
       return () => clearInterval(t);
     }
 
@@ -614,34 +598,20 @@ export function Dashboard() {
 
       if (!futLtp) return;
 
-      // Freshness guard: Future/Spot must never silently re-stamp a stale cached price into
-      // a brand-new row as if it were live. If no "tick" socket event has updated this
-      // symbol within FRESH_TTL_MS, render "—" for that side's OHLC instead — the same
-      // honest-missing-data treatment Call/Put already get when no option tick has arrived.
-      // The raw futLtp/spotLtp values (always the last real known price) still feed ranking/
-      // SMC/Fibonacci below, unchanged — only the rendered OHLC bar goes blank when stale.
       const FRESH_TTL_MS = 8000;
       const futUpdatedAt  = prices["NIFTY-FUT"]?.lastUpdated?.getTime();
       const futFresh      = futUpdatedAt  !== undefined && (now - futUpdatedAt)  < FRESH_TTL_MS;
       const spotUpdatedAt = prices["NIFTY-SPOT"]?.lastUpdated?.getTime();
       const spotFresh     = spotUpdatedAt !== undefined && (now - spotUpdatedAt) < FRESH_TTL_MS;
 
-      // C-1: derive option symbols dynamically and use option LTP for CE/PE bars.
       const { expiryDate: expDate, instrument: inst, callStrike: cs, putStrike: ps, type: t } =
         useDashStore.getState();
       const exFmt    = formatExpiryForBroker(expDate);
       const ceSymbol = (exFmt && t !== "Put"  && cs) ? `${inst}${exFmt}C${cs}` : null;
       const peSymbol = (exFmt && t !== "Call" && ps) ? `${inst}${exFmt}P${ps}`  : null;
-      // No fallback to futLtp — null means "no option tick yet" and renders as "—".
       const ceLtp = ceSymbol ? (prices[ceSymbol]?.ltp ?? null) : null;
       const peLtp = peSymbol ? (prices[peSymbol]?.ltp ?? null) : null;
 
-      // True-VWAP live volume: the raw tick stream never reaches the frontend
-      // with volume (useSocket only forwards ltp), so poll the existing
-      // active-candle endpoint — the backend's own running total for the
-      // forming Future bar — rather than re-deriving it from ticks here.
-      // Fire-and-forget: liveFutVolumeRef.current is read synchronously below
-      // and simply lags by at most one 500ms tick.
       const futSymForVolume = `${(inst || "NIFTY").toUpperCase()}-FUT`;
       api.get(`/api/market/futures/${futSymForVolume}?timeframe=${timeframe}`)
         .then((data: any) => {
@@ -653,13 +623,9 @@ export function Dashboard() {
 
       if (oi.tin !== prevOiTin.current) {
         console.log(
-          `[Dashboard] OI tick — tin=${oi.tin} futLtp=${futLtp} ceLtp=${ceLtp ?? "—"} peLtp=${peLtp ?? "—"} ` +
+          `[Module1/Data] OI tick — tin=${oi.tin} futLtp=${futLtp} ceLtp=${ceLtp ?? "—"} peLtp=${peLtp ?? "—"} ` +
           `src=${oi.dataSource} window=${new Date(windowStart).toISOString()}`
         );
-        if (process.env.NODE_ENV === "development") {
-          if (ceSymbol && ceLtp === null) console.warn(`[Dashboard] No live tick for CE ${ceSymbol} — Call live bar will show "—"`);
-          if (peSymbol && peLtp === null) console.warn(`[Dashboard] No live tick for PE ${peSymbol} — Put live bar will show "—"`);
-        }
         prevOiTin.current = oi.tin;
       }
 
@@ -675,25 +641,15 @@ export function Dashboard() {
             const k200 = 2 / (200 + 1);
             prevEma200Ref.current = pb.spotC * k200 + prevEma200Ref.current * (1 - k200);
           }
-          // Fold the just-closed Future bar's TP×Volume into the running VWAP
-          // state — only when that bar's Future OHLC was actually fresh (not
-          // MISSING_BAR'd by the staleness guard), matching the same NaN
-          // guard already used below for RSI/session-high-low.
           if (!isNaN(pb.futH) && !isNaN(pb.futL) && !isNaN(pb.futC)) {
             vwapStateRef.current.cumTPV += ((pb.futH + pb.futL + pb.futC) / 3) * pb.futVolume;
             vwapStateRef.current.cumV   += pb.futVolume;
           }
-          // Fold the just-closed bar into each side's cumulative TMA state —
-          // tmaAccumulate itself skips NaN bars (e.g. no option tick arrived
-          // during the whole bar), matching the history builder's semantics.
           const tmaFold = tmaStatesRef.current;
           tmaAccumulate(tmaFold.call, { t: pb.windowStart, o: pb.callO, h: pb.callH, l: pb.callL, c: pb.callC });
           tmaAccumulate(tmaFold.put,  { t: pb.windowStart, o: pb.putO,  h: pb.putH,  l: pb.putL,  c: pb.putC  });
           tmaAccumulate(tmaFold.fut,  { t: pb.windowStart, o: pb.futO,  h: pb.futH,  l: pb.futL,  c: pb.futC  });
           tmaAccumulate(tmaFold.spot, { t: pb.windowStart, o: pb.spotO, h: pb.spotH, l: pb.spotL, c: pb.spotC });
-          // RSI closes and session high/low track the FUTURE series only —
-          // option premiums must never feed either (history seeds them from
-          // futCloses/fut H-L above, so live continuation must match).
           if (!isNaN(pb.futC)) {
             prevRsiCloses.current = [...prevRsiCloses.current, pb.futC].slice(-50);
           }
@@ -702,12 +658,10 @@ export function Dashboard() {
         }
 
         if (dash.rows.length === 0) {
-          console.log(`[AutoGenerate] ✓ First candle created — futLtp=${futLtp} ceLtp=${ceLtp} peLtp=${peLtp} t=${new Date(windowStart).toISOString()}`);
+          console.log(`[Module1/Data] ✓ First candle created — futLtp=${futLtp} ceLtp=${ceLtp} peLtp=${peLtp} t=${new Date(windowStart).toISOString()}`);
         }
 
         const sLtp = spotLtp ?? futLtp;
-        // NaN = "no option tick yet this session" — renders "—", never another
-        // instrument's price.
         const ceN  = ceLtp ?? NaN;
         const peN  = peLtp ?? NaN;
         barRef.current = {
@@ -724,8 +678,6 @@ export function Dashboard() {
         const futBar:  OHLCBar = futFresh  ? { t: windowStart, o: futLtp, h: futLtp, l: futLtp, c: futLtp } : MISSING_BAR(windowStart);
         const spotBar: OHLCBar = spotFresh ? { t: windowStart, o: sLtp,   h: sLtp,   l: sLtp,   c: sLtp   } : MISSING_BAR(windowStart);
 
-        // Session high/low = FUTURE series only, including the forming bar —
-        // same semantics as the historical builder (never Call/Put values).
         const sessHigh = Math.max(swHighRef.current, futLtp);
         const sessLow  = Math.min(swLowRef.current,  futLtp);
 
@@ -733,9 +685,6 @@ export function Dashboard() {
         const pMMA = mmaBar(putBar);
         const fMMA = mmaBar(futBar);
         const sMMA = mmaBar(spotBar);
-        // TMA = closed-bars cumulative state + this forming bar's current
-        // OHLC (recomputed from the state every tick, never folded in until
-        // the window closes — see the rollover block above).
         const tmaSt = tmaStatesRef.current;
         const cTMA = tmaValue(tmaSt.call, callBar);
         const pTMA = tmaValue(tmaSt.put,  putBar);
@@ -743,17 +692,12 @@ export function Dashboard() {
         const sTMA = tmaValue(tmaSt.spot, spotBar);
         const { value: rankVal, winner: rankWin } = computeRanking(cMMA, pMMA);
 
-        // RSI is always computed from Future closes — never option premiums.
         const rsiSer = computeRsiSeries([...prevRsiCloses.current, futLtp]);
         const rsi    = rsiSer[rsiSer.length - 1] ?? null;
         const k2     = 2 / (20 + 1);
         const ema    = prevEmaRef.current !== null ? sLtp * k2 + prevEmaRef.current * (1 - k2) : null;
         const k200   = 2 / (200 + 1);
         const ema200 = prevEma200Ref.current !== null ? sLtp * k200 + prevEma200Ref.current * (1 - k200) : null;
-        // True VWAP: fold the forming Future bar's own TP×Volume-so-far on
-        // top of the closed-bars cumulative state. futFresh guards against
-        // computing a TP off a stale/MISSING_BAR futBar; volume unavailable
-        // (cumV+liveVol === 0) correctly yields null, never a fake average.
         const liveTp  = futFresh ? (futBar.h + futBar.l + futBar.c) / 3 : null;
         const liveVol = liveTp !== null ? liveFutVolumeRef.current : 0;
         const vwapCumV = vwapStateRef.current.cumV + liveVol;
@@ -783,8 +727,6 @@ export function Dashboard() {
 
       } else {
         const b = barRef.current;
-        // Only update call/put OHLC when a real tick arrived (ceLtp/peLtp !== null).
-        // First valid tick after bar open also back-fills the Open that was set to NaN.
         if (ceLtp !== null) {
           b.callH = isNaN(b.callH) ? ceLtp : Math.max(b.callH, ceLtp);
           b.callL = isNaN(b.callL) ? ceLtp : Math.min(b.callL, ceLtp);
@@ -808,15 +750,9 @@ export function Dashboard() {
 
         const callBar: OHLCBar = { t: b.windowStart, o: b.callO, h: b.callH, l: b.callL, c: b.callC };
         const putBar:  OHLCBar = { t: b.windowStart, o: b.putO,  h: b.putH,  l: b.putL,  c: b.putC  };
-        // b.futO/H/L/C and b.spotO/H/L/C keep tracking the last real price internally
-        // (needed so Math.max/min stay correct once fresh ticks resume) — the bar actually
-        // rendered goes blank when stale rather than re-stamping a stale number
-        // (see FRESH_TTL_MS above).
         const futBar:  OHLCBar = futFresh  ? { t: b.windowStart, o: b.futO,  h: b.futH,  l: b.futL,  c: b.futC  } : MISSING_BAR(b.windowStart);
         const spotBar: OHLCBar = spotFresh ? { t: b.windowStart, o: b.spotO, h: b.spotH, l: b.spotL, c: b.spotC } : MISSING_BAR(b.windowStart);
 
-        // Session high/low = FUTURE series only, including the forming bar —
-        // same semantics as the historical builder (never Call/Put values).
         const sessHigh = Math.max(swHighRef.current, b.futH);
         const sessLow  = Math.min(swLowRef.current,  b.futL);
 
@@ -824,7 +760,6 @@ export function Dashboard() {
         const pMMA = mmaBar(putBar);
         const fMMA = mmaBar(futBar);
         const sMMA = mmaBar(spotBar);
-        // TMA — closed-bars state + forming bar, same as the new-bar branch.
         const tmaSt = tmaStatesRef.current;
         const cTMA = tmaValue(tmaSt.call, callBar);
         const pTMA = tmaValue(tmaSt.put,  putBar);
@@ -832,14 +767,12 @@ export function Dashboard() {
         const sTMA = tmaValue(tmaSt.spot, spotBar);
         const { value: rankVal, winner: rankWin } = computeRanking(cMMA, pMMA);
 
-        // RSI is always computed from Future closes — never option premiums.
         const rsiSer = computeRsiSeries([...prevRsiCloses.current, futLtp]);
         const rsi    = rsiSer[rsiSer.length - 1] ?? null;
         const k2     = 2 / (20 + 1);
         const ema    = prevEmaRef.current !== null ? sLtp * k2 + prevEmaRef.current * (1 - k2) : null;
         const k200   = 2 / (200 + 1);
         const ema200 = prevEma200Ref.current !== null ? sLtp * k200 + prevEma200Ref.current * (1 - k200) : null;
-        // True VWAP — see the equivalent new-bar branch above for rationale.
         const liveTp  = futFresh ? (futBar.h + futBar.l + futBar.c) / 3 : null;
         const liveVol = liveTp !== null ? liveFutVolumeRef.current : 0;
         const vwapCumV = vwapStateRef.current.cumV + liveVol;
@@ -874,11 +807,7 @@ export function Dashboard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isGenerated, timeframe]);
 
-  // Effect 3: automatic end-of-day Excel export. Once NSE closes (15:45 IST,
-  // Mon–Fri) this fires exactly once per trading day and flags itself done in
-  // localStorage, so a page refresh after the download already happened does
-  // not trigger a second one. Checked on a 60s poll rather than a single
-  // timer-at-close because the tab may not be open exactly at market close.
+  // Effect 3: automatic end-of-day Excel export.
   useEffect(() => {
     if (!isGenerated) return;
 
@@ -892,7 +821,7 @@ export function Dashboard() {
       if (partMap.weekday === "Sat" || partMap.weekday === "Sun") return;
 
       const minutesNow = parseInt(partMap.hour, 10) * 60 + parseInt(partMap.minute, 10);
-      const MARKET_CLOSE_MIN = 15 * 60 + 45; // 3:45 PM IST — matches backend isMarketOpenTime
+      const MARKET_CLOSE_MIN = 15 * 60 + 45; // 3:45 PM IST
       if (minutesNow < MARKET_CLOSE_MIN) return;
 
       const flagKey = scopedKey(`m1_eod_export_${istDateStr()}`);
@@ -951,7 +880,6 @@ export function Dashboard() {
           display: "flex",
           alignItems: "center",
           justifyContent: "space-between",
-          
           fontFamily: "'Calibri','Segoe UI',system-ui,sans-serif",
           flexShrink: 0,
         }}>

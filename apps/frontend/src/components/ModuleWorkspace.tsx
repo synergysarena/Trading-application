@@ -38,7 +38,7 @@ function useResumeModule1Session(active: boolean, module1Token: string | null) {
     setModule1Status("authenticating");
     api.post("/auth/module1-resume-session", {}, { skipAuth: true })
       .then((res: { result?: string }) => {
-        console.log(`[ModuleWorkspace] Module 1 session resume: ${res?.result ?? "unknown"}`);
+        console.log(`[Module1/Lifecycle] Module 1 session resume: ${res?.result ?? "unknown"}`);
         // Actual live/offline state still comes from the broker_status socket
         // event and the dashboard's own /api/market/status polling — this
         // just unblocks the sidebar's "storeStatus" badge from sitting at its
@@ -47,7 +47,7 @@ function useResumeModule1Session(active: boolean, module1Token: string | null) {
         setModule1Status("authenticated");
       })
       .catch((err: any) => {
-        console.warn("[ModuleWorkspace] Module 1 session resume failed:", err?.message || err);
+        console.warn("[Module1/Lifecycle] Module 1 session resume failed:", err?.message || err);
         // Non-fatal: the dashboard's existing StatusPanel (broker-disconnected
         // / api-error, both with a Retry button) already handles "no live
         // feed" gracefully — this isn't a new failure mode, just an earlier
