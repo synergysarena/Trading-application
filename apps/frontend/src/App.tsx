@@ -1,14 +1,16 @@
 import { useEffect, useState } from "react";
 import { Routes, Route, Navigate, Link, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { useSocket } from "./hooks/useSocket";
+import { useSocket, getGlobalSocket } from "./hooks/useSocket";
 import { useStore } from "./store/useStore";
 import { api, API_BASE } from "./utils/api";
 import { Auth } from "./components/Auth";
 import { ModuleSelection } from "./components/ModuleSelection";
 import ModuleWorkspace from "./components/ModuleWorkspace";
 import { DocsPage } from "./modules/docs";
-import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
+import { GlobalNetworkStatusBanner } from "./components/GlobalNetworkStatusBanner";
+import { ShutdownConfirmationModal } from "./components/ShutdownConfirmationModal";
+import { PanelLeftClose, PanelLeftOpen, Power } from "lucide-react";
 import { SidebarDezproxFooter } from "./components/branding/Dezprox";
 
 const GREEN = "#16a34a";
@@ -75,63 +77,101 @@ function ModuleTopBar({
     cursor: "pointer", transition: "all 0.15s",
   });
 
+  const [isShutdownModalOpen, setIsShutdownModalOpen] = useState(false);
+
   return (
-    <header style={{
-      height: 60, display: "flex", alignItems: "center", justifyContent: "space-between",
-      padding: "0 24px", background: "#ffffff", borderBottom: "1.5px solid #d8e0ea",
-      position: "sticky", top: 0, zIndex: 30,
-      boxShadow: "0 1px 4px rgba(15,32,51,0.06)",
-    }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
-        <button
-          onClick={toggleSidebar}
-          className="hidden md:flex sidebar-toggle-btn"
-          title={isSidebarCollapsed ? "Expand Sidebar" : "Collapse Sidebar"}
-        >
-          {isSidebarCollapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
-        </button>
-
-        <div style={{ display: "flex", alignItems: "center", gap: 6, paddingRight: 20, borderRight: "1.5px solid #d8e0ea" }}>
-          <span style={{ fontSize: 11, fontWeight: 600, color: "#94a3b8", letterSpacing: "0.08em", textTransform: "uppercase" }}>Time</span>
-          <span style={{ fontFamily: "'Inter', sans-serif", fontSize: 14, fontWeight: 800, color: "#102033" }}>{timeStr}</span>
-        </div>
-
-        <div style={{ display: "none", alignItems: "center", gap: 6, paddingRight: 20, borderRight: "1.5px solid #d8e0ea" }}>
-          {[{ key: "1m", label: "1M" }, { key: "3m", label: "3M" }, { key: "5m", label: "5M" }].map((tf) => (
-            <button key={tf.key} onClick={() => setSelectedTimeframe(tf.key)} style={tfBtn(selectedTimeframe === tf.key)}>
-              {tf.label}
-            </button>
-          ))}
-          <button onClick={handleCustomTf} style={tfBtn(isCustomTf)}>
-            {isCustomTf ? selectedTimeframe.toUpperCase() : "Custom"}
+    <>
+      <ShutdownConfirmationModal
+        isOpen={isShutdownModalOpen}
+        onClose={() => setIsShutdownModalOpen(false)}
+      />
+      <header style={{
+        height: 60, display: "flex", alignItems: "center", justifyContent: "space-between",
+        padding: "0 24px", background: "#ffffff", borderBottom: "1.5px solid #d8e0ea",
+        position: "sticky", top: 0, zIndex: 30,
+        boxShadow: "0 1px 4px rgba(15,32,51,0.06)",
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+          <button
+            onClick={toggleSidebar}
+            className="hidden md:flex sidebar-toggle-btn"
+            title={isSidebarCollapsed ? "Expand Sidebar" : "Collapse Sidebar"}
+          >
+            {isSidebarCollapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
           </button>
+
+          <div style={{ display: "flex", alignItems: "center", gap: 6, paddingRight: 20, borderRight: "1.5px solid #d8e0ea" }}>
+            <span style={{ fontSize: 11, fontWeight: 600, color: "#94a3b8", letterSpacing: "0.08em", textTransform: "uppercase" }}>Time</span>
+            <span style={{ fontFamily: "'Inter', sans-serif", fontSize: 14, fontWeight: 800, color: "#102033" }}>{timeStr}</span>
+          </div>
+
+          <div style={{ display: "none", alignItems: "center", gap: 6, paddingRight: 20, borderRight: "1.5px solid #d8e0ea" }}>
+            {[{ key: "1m", label: "1M" }, { key: "3m", label: "3M" }, { key: "5m", label: "5M" }].map((tf) => (
+              <button key={tf.key} onClick={() => setSelectedTimeframe(tf.key)} style={tfBtn(selectedTimeframe === tf.key)}>
+                {tf.label}
+              </button>
+            ))}
+            <button onClick={handleCustomTf} style={tfBtn(isCustomTf)}>
+              {isCustomTf ? selectedTimeframe.toUpperCase() : "Custom"}
+            </button>
+          </div>
+
+          <div style={{ display: "none", alignItems: "center", gap: 6 }}>
+            <span style={{
+              width: 7, height: 7, borderRadius: "50%", display: "inline-block",
+              background: isMarketClosed ? "#dc2626" : GREEN,
+              boxShadow: isMarketClosed ? "0 0 0 2px rgba(220,38,38,0.2)" : "0 0 0 2px rgba(22,163,74,0.2)",
+            }} className={isMarketClosed ? "" : "animate-pulse"} />
+            <span style={{ fontSize: 12, fontWeight: 600, color: "#5b6b82" }}>
+              Market: <span style={{ color: isMarketClosed ? "#dc2626" : GREEN }}>{isMarketClosed ? "Closed" : "Live"}</span>
+            </span>
+          </div>
         </div>
 
-        <div style={{ display: "none", alignItems: "center", gap: 6 }}>
-          <span style={{
-            width: 7, height: 7, borderRadius: "50%", display: "inline-block",
-            background: isMarketClosed ? "#dc2626" : GREEN,
-            boxShadow: isMarketClosed ? "0 0 0 2px rgba(220,38,38,0.2)" : "0 0 0 2px rgba(22,163,74,0.2)",
-          }} className={isMarketClosed ? "" : "animate-pulse"} />
-          <span style={{ fontSize: 12, fontWeight: 600, color: "#5b6b82" }}>
-            Market: <span style={{ color: isMarketClosed ? "#dc2626" : GREEN }}>{isMarketClosed ? "Closed" : "Live"}</span>
-          </span>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={{ textAlign: "right", paddingRight: 12, borderRight: "1.5px solid #d8e0ea" }}>
+            <div style={{ fontSize: 9, fontWeight: 600, color: "#94a3b8", textTransform: "uppercase", letterSpacing: "0.1em" }}>User</div>
+            <div style={{ fontSize: 13, fontWeight: 700, color: "#102033" }}>{user?.name || user?.username || "—"}</div>
+          </div>
+          <button
+            onClick={() => setIsShutdownModalOpen(true)}
+            title="Administrative control to shutdown all live market feeds globally"
+            style={{
+              fontFamily: "'Inter', sans-serif",
+              fontSize: 11,
+              fontWeight: 700,
+              padding: "5px 12px",
+              borderRadius: 6,
+              border: "1.5px solid #FCA5A5",
+              background: "#FEF2F2",
+              color: "#991B1B",
+              cursor: "pointer",
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              transition: "all 0.15s",
+            }}
+            onMouseOver={(e) => {
+              e.currentTarget.style.background = "#FEE2E2";
+              e.currentTarget.style.borderColor = "#F87171";
+            }}
+            onMouseOut={(e) => {
+              e.currentTarget.style.background = "#FEF2F2";
+              e.currentTarget.style.borderColor = "#FCA5A5";
+            }}
+          >
+            <Power size={13} color="#DC2626" />
+            <span>Shutdown All Market Data</span>
+          </button>
+          <button onClick={handleLogout} style={{
+            fontFamily: "'Inter', sans-serif", fontSize: 11, fontWeight: 700,
+            padding: "5px 14px", borderRadius: 6,
+            border: "1.5px solid rgba(220,38,38,0.4)", background: "transparent",
+            color: "#dc2626", cursor: "pointer",
+          }}>Logout</button>
         </div>
-      </div>
-
-      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-        <div style={{ textAlign: "right", paddingRight: 12, borderRight: "1.5px solid #d8e0ea" }}>
-          <div style={{ fontSize: 9, fontWeight: 600, color: "#94a3b8", textTransform: "uppercase", letterSpacing: "0.1em" }}>User</div>
-          <div style={{ fontSize: 13, fontWeight: 700, color: "#102033" }}>{user?.name || user?.username || "—"}</div>
-        </div>
-        <button onClick={handleLogout} style={{
-          fontFamily: "'Inter', sans-serif", fontSize: 11, fontWeight: 700,
-          padding: "5px 14px", borderRadius: 6,
-          border: "1.5px solid rgba(220,38,38,0.4)", background: "transparent",
-          color: "#dc2626", cursor: "pointer",
-        }}>Logout</button>
-      </div>
-    </header>
+      </header>
+    </>
   );
 }
 
@@ -282,7 +322,10 @@ function ModuleDashboardLayout({ children }: { children: React.ReactNode }) {
   });
 
   const handleLogout = async () => {
-    try { await api.post("/auth/logout"); } catch {}
+    const sock = getGlobalSocket();
+    try {
+      await api.post("/auth/logout", {}, { headers: sock?.id ? { "x-socket-id": sock.id } : undefined });
+    } catch {}
     clearAuth();
     navigate("/login", { replace: true });
   };
@@ -339,6 +382,35 @@ function App() {
     checkAuth();
   }, [setAuth]);
 
+  // Cross-tab synchronization strictly for Global Shutdown
+  useEffect(() => {
+    if (typeof BroadcastChannel === "undefined") return;
+    const bc = new BroadcastChannel("tradepro_global_channel");
+    bc.onmessage = (event) => {
+      const type = event.data?.type;
+      if (type === "GLOBAL_SHUTDOWN") {
+        console.log("[App/CrossTab] Global shutdown event received across tabs");
+        sessionStorage.removeItem("m1_token");
+        sessionStorage.removeItem("m2_token");
+        useStore.setState({
+          module1Token: null,
+          module2Token: null,
+          module1Status: "idle",
+          module2Status: "idle",
+          module2BrokerStatus: "broker-disconnected",
+        });
+        if (window.location.pathname.includes("/dashboard/module-")) {
+          window.location.href = "/dashboard";
+        }
+      }
+    };
+    return () => {
+      bc.close();
+    };
+  }, []);
+
+
+
   if (isInitializing) {
     return (
       <div style={{ display: "flex", minHeight: "100vh", alignItems: "center", justifyContent: "center", background: "#f5f7fa", fontFamily: "'Inter', sans-serif" }}>
@@ -353,6 +425,7 @@ function App() {
   return (
     <>
       <style>{`@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');`}</style>
+      <GlobalNetworkStatusBanner />
       <Routes>
         {/* ── PUBLIC: App login ─────────────────────────────────────────── */}
         <Route path="/login" element={accessToken ? <Navigate to="/dashboard" replace /> : <Auth />} />

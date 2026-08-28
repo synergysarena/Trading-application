@@ -70,44 +70,34 @@ export const stopSession = async (req: AuthenticatedRequest, res: Response) => {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    console.log(`[MODULE2][TRACKER] Stop button clicked for user=${userId}`);
+    const { sessionId } = (req.body || {}) as { sessionId?: string };
+    console.log(`[MODULE2-TRACKER] Stop request received for user=${userId} sessionId=${sessionId || "ALL"}`);
 
-    // Collect all active session IDs for this user
-    const userActiveSessionIds = Object.keys(activeSessions).filter(
-      (sId) => activeSessions[sId].userId === userId
-    );
-
-    const bodySessionId = req.body?.sessionId;
-    if (bodySessionId && !userActiveSessionIds.includes(bodySessionId)) {
-      userActiveSessionIds.push(bodySessionId);
-    }
-
-    console.log(`[MODULE2][TRACKER] Stopping ${userActiveSessionIds.length} active session(s) for user=${userId}`);
-
-    for (const sId of userActiveSessionIds) {
-      await stopTrackerSession(sId);
-    }
-
-    // Purge memory cache for user
-    for (const [sId, sess] of Object.entries(activeSessions)) {
-      if (sess.userId === userId) {
+    if (sessionId) {
+      // Stop strictly this targeted session
+      await stopTrackerSession(sessionId);
+      delete activeSessions[sessionId];
+      Module2Session.findByIdAndDelete(sessionId).catch(() => {});
+    } else {
+      // Fallback: stop all sessions strictly belonging to this user
+      const userActiveSessionIds = Object.keys(activeSessions).filter(
+        (sId) => activeSessions[sId].userId === userId
+      );
+      for (const sId of userActiveSessionIds) {
+        await stopTrackerSession(sId);
         delete activeSessions[sId];
       }
     }
 
-    // Delete database session records for this user asynchronously so nothing remains for restoration
-    Module2Session.deleteMany({ user_id: userId }).catch((err) => {
-      console.warn("[MODULE2][TRACKER] Non-blocking DB session delete notice:", err?.message || err);
-    });
-
-    console.log("[MODULE2][TRACKER] Session stopped successfully");
+    console.log(`[MODULE2-TRACKER] Session stop complete for user=${userId} sessionId=${sessionId || "ALL"}. Remaining total sessions: ${Object.keys(activeSessions).length}`);
     return res.status(200).json({ status: "success", message: "Session stopped successfully" });
+
   } catch (error) {
-    console.error("[MODULE2][TRACKER] Stop Session Error:", error);
-    // Idempotent fallback — always return 200 OK so frontend state is cleared cleanly
+    console.error("[MODULE2-TRACKER] Stop Session Error:", error);
     return res.status(200).json({ status: "success", message: "Session stopped successfully" });
   }
 };
+
 
 // Get current active session for user
 export const getCurrentSession = async (req: AuthenticatedRequest, res: Response) => {

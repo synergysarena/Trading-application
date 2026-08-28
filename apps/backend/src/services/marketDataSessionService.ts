@@ -1,5 +1,6 @@
 import axios from "axios";
 import { getModule2MissingInteractiveConfig } from "./module2InteractiveDataService";
+import redis from "../config/redis";
 
 /**
  * Market Data (Symphony XTS / AETRAM) authentication & session management.
@@ -141,9 +142,21 @@ export const loginMarketData = async (
   appKey?: string,
   secretKey?: string
 ): Promise<MarketDataLoginResult> => {
+  // If backend already has a live, unexpired Aetram session, reuse it without invalidating the active WebSocket
+  if (isMarketDataAuthenticated() && session) {
+    console.log("[Module2Auth] Active Aetram session already established. Reusing existing session.");
+    return {
+      ok: true,
+      status: "AUTHENTICATED",
+      userID: session.userID,
+      expiresAt: session.expiresAt.toISOString(),
+    };
+  }
+
   const authUrl = getAuthUrl();
   const key = (appKey || getEnvAppKey()).trim();
   const secret = (secretKey || getEnvSecret()).trim();
+
 
   const missing: string[] = [];
   if (!authUrl) missing.push("AETRAM_MARKETDATA_AUTH_URL");
@@ -334,9 +347,13 @@ Axios URL: ${error?.config?.url}
  * End the Market Data session. Best-effort remote invalidation, then the local
  * session is always cleared.
  */
-export const logoutMarketData = async (): Promise<{ loggedOut: boolean }> => {
+export const logoutMarketData = async (userId?: string): Promise<{ loggedOut: boolean }> => {
   const token = session?.token;
   const baseUrl = getBaseUrl();
+
+  if (userId) {
+    clearPersistedAetramBrokerSession(userId);
+  }
 
   if (token && baseUrl) {
     try {
@@ -355,6 +372,58 @@ export const logoutMarketData = async (): Promise<{ loggedOut: boolean }> => {
 
   session = null;
   sessionEnded = "logout";
-  console.log("[Module2Auth] Logout complete — session cleared.");
+  console.log(`[Module2Auth] Logout complete — session cleared${userId ? ` for user ${userId}` : ""}.`);
   return { loggedOut: true };
 };
+
+// ── User-Scoped Broker-Session Persistence (for reconnection & multi-user isolation) ──
+
+const BROKER_SESSION_TTL_SECONDS = 8 * 60 * 60; // 8 hours
+
+export const persistAetramBrokerSession = (userId: string, brokerSession: MarketDataSession) => {
+  if (!userId) return;
+  const key = `module2:broker-session:${userId}`;
+  redis.setex(key, BROKER_SESSION_TTL_SECONDS, JSON.stringify(brokerSession))
+    .catch((err: any) => console.warn(`[Module2Auth] Failed to persist broker session for user ${userId}:`, err?.message || err));
+};
+
+export const clearPersistedAetramBrokerSession = (userId: string) => {
+  if (!userId) return;
+  const key = `module2:broker-session:${userId}`;
+  redis.del(key).catch(() => { /* best-effort */ });
+};
+
+export const resumeAetramFromPersistedSession = async (userId: string): Promise<"resumed" | "already-live" | "no-session"> => {
+  if (!userId) return "no-session";
+  if (isMarketDataAuthenticated()) {
+    return "already-live";
+  }
+
+  try {
+    const raw = await redis.get(`module2:broker-session:${userId}`);
+    if (!raw) return "no-session";
+    const data = typeof raw === "string" ? JSON.parse(raw) : raw;
+    if (!data || !data.token || !data.expiresAt) return "no-session";
+
+    const expiresAt = new Date(data.expiresAt);
+    if (Date.now() >= expiresAt.getTime()) {
+      clearPersistedAetramBrokerSession(userId);
+      return "no-session";
+    }
+
+    session = {
+      token: data.token,
+      userID: data.userID || "AETRAM_USER",
+      loginTime: new Date(data.loginTime || Date.now()),
+      expiresAt,
+    };
+    sessionEnded = null;
+
+    console.log(`[Module2Auth] Resumed persisted Aetram broker session for user: ${userId}`);
+    return "resumed";
+  } catch (err: any) {
+    console.warn(`[Module2Auth] Resume failed for user ${userId}:`, err?.message || err);
+    return "no-session";
+  }
+};
+

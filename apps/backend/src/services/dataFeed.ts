@@ -1,8 +1,9 @@
 import { bufferSet, bufferSetex } from "./redisWriteBuffer";
-import { aggregateOHLC } from "./ohlcAggregator";
+import { aggregateOHLC, startBoundaryChecker } from "./ohlcAggregator";
 import { Tick } from "@stock/shared";
 import { ingestModule1OiTick, setModule1OiDataSource, resetModule1OiMaps } from "./module1OiService";
 import { recordTickReceived } from "./monitoringService";
+import { enableMarketDataProcessing } from "./marketDataLifecycle";
 import redis from "../config/redis";
 import {
   startZebuMarketDataFeedWithCredentials, setRuntimeInstrumentTokens,
@@ -32,12 +33,12 @@ const BROKER_SESSION_REDIS_KEY = "module1:broker-session";
 // there is nothing left worth resuming.
 const BROKER_SESSION_TTL_SECONDS = 8 * 60 * 60;
 
-const persistBrokerSession = (userId: string, sessionToken: string) => {
+export const persistBrokerSession = (userId: string, sessionToken: string) => {
   redis.setex(BROKER_SESSION_REDIS_KEY, BROKER_SESSION_TTL_SECONDS, JSON.stringify({ userId, sessionToken }))
     .catch((err: any) => console.warn("[DataFeed] Failed to persist broker session for later resume:", err?.message || err));
 };
 
-const clearPersistedBrokerSession = () => {
+export const clearPersistedBrokerSession = () => {
   redis.del(BROKER_SESSION_REDIS_KEY).catch(() => { /* best-effort */ });
 };
 
@@ -147,82 +148,118 @@ const handleSessionExpired = (gen: number) => {
   broadcastBrokerStatus("session-expired", "Broker session expired. Please reconnect.", "module1");
 };
 
+let isConnecting = false;
+
 /**
  * Start the live data feed using credentials obtained from user-initiated broker login.
  * Called by module1BrokerLogin controller after successful Zebu QuickAuth.
  */
 export const startDataFeedWithCredentials = async (userId: string, sessionToken: string) => {
-  // Close any existing connection first
-  if (zebuClient) {
-    try { zebuClient.close(); } catch {}
-    zebuClient = null;
+  if (isZebuLiveConnected()) {
+    console.log("[DataFeed] Zebu feed already live — reusing active connection.");
+    persistBrokerSession(userId, sessionToken);
+    return;
   }
-  clearReconnectTimer();
+  if (isConnecting) {
+    console.log("[DataFeed] Zebu feed connection already in progress — skipping duplicate start.");
+    persistBrokerSession(userId, sessionToken);
+    return;
+  }
 
-  // Bump generation so any in-flight disconnect callbacks from the old
-  // connection are silently ignored when they eventually fire.
-  const gen = ++connectionGeneration;
+  isConnecting = true;
+  enableMarketDataProcessing();
+  startBoundaryChecker();
 
-  // Store credentials for auto-reconnection
-  storedUserId = userId;
-  storedSessionToken = sessionToken;
-  sessionExpired = false;
-  reconnectAttempts = 0;
-  // Best-effort durable copy so a later resume (session-restore path) can
-  // restart the feed even after this process-memory copy is gone.
-  persistBrokerSession(userId, sessionToken);
-
-  // Clear stale market_ready flag from any previous session. Without this a
-  // newly connected frontend socket receives a replay that sets marketDataReady=true
-  // before any real ticks exist, triggering auto-generate against empty OHLC.
-  resetMarketReady();
-
-  // Reset the ATM-band recompute latch for this connection — see declaration above.
-  atmIsReliableAtConnect = true;
-  atmBandRecomputed = false;
-
-  // Always refresh instrument tokens before connecting (handles weekly/monthly expiry)
-  console.log("[DataFeed] Refreshing instrument tokens from NFO master...");
-  const freshTokens = await refreshInstrumentTokens().catch(() => null);
-  if (freshTokens) {
-    setRuntimeInstrumentTokens(freshTokens.futToken, freshTokens.ceTokens, freshTokens.peTokens);
-    // Purge any stale in-memory OI from warmup (may reference expired contracts whose
-    // Redis keys had no TTL). New values arrive from live ticks within seconds.
-    resetModule1OiMaps();
-    atmIsReliableAtConnect = freshTokens.atmIsReliable;
-    if (!atmIsReliableAtConnect) {
-      console.warn("[DataFeed] ATM band was seeded from a stale fallback at connect time — will recompute from the first real spot/futures tick.");
+  try {
+    // Close any existing connection first
+    if (zebuClient) {
+      try { zebuClient.close(); } catch {}
+      zebuClient = null;
     }
-    console.log(`[DataFeed] Tokens refreshed — futures expiry: ${freshTokens.futExpiry} | option expiry: ${freshTokens.nearestOptionExpiry}`);
-  } else {
-    console.warn("[DataFeed] NFO token refresh failed — using .env tokens (check network / NFO URL).");
+    clearReconnectTimer();
+
+    // Bump generation so any in-flight disconnect callbacks from the old
+    // connection are silently ignored when they eventually fire.
+    const gen = ++connectionGeneration;
+
+    // Store credentials for auto-reconnection
+    storedUserId = userId;
+    storedSessionToken = sessionToken;
+    sessionExpired = false;
+    reconnectAttempts = 0;
+    // Best-effort durable copy so a later resume (session-restore path) can
+    // restart the feed even after this process-memory copy is gone.
+    persistBrokerSession(userId, sessionToken);
+
+    // Clear stale market_ready flag from any previous session. Without this a
+    // newly connected frontend socket receives a replay that sets marketDataReady=true
+    // before any real ticks exist, triggering auto-generate against empty OHLC.
+    resetMarketReady();
+
+    // Reset the ATM-band recompute latch for this connection — see declaration above.
+    atmIsReliableAtConnect = true;
+    atmBandRecomputed = false;
+
+    // Always refresh instrument tokens before connecting (handles weekly/monthly expiry)
+    console.log("[DataFeed] Refreshing instrument tokens from NFO master...");
+    const freshTokens = await refreshInstrumentTokens().catch(() => null);
+    if (freshTokens) {
+      setRuntimeInstrumentTokens(freshTokens.futToken, freshTokens.ceTokens, freshTokens.peTokens);
+      // Purge any stale in-memory OI from warmup (may reference expired contracts whose
+      // Redis keys had no TTL). New values arrive from live ticks within seconds.
+      resetModule1OiMaps();
+      atmIsReliableAtConnect = freshTokens.atmIsReliable;
+      if (!atmIsReliableAtConnect) {
+        console.warn("[DataFeed] ATM band was seeded from a stale fallback at connect time — will recompute from the first real spot/futures tick.");
+      }
+      console.log(`[DataFeed] Tokens refreshed — futures expiry: ${freshTokens.futExpiry} | option expiry: ${freshTokens.nearestOptionExpiry}`);
+    } else {
+      console.warn("[DataFeed] NFO token refresh failed — using .env tokens (check network / NFO URL).");
+    }
+
+    console.log(`[DataFeed] Starting live feed for user: ${userId}`);
+
+    zebuClient = startZebuMarketDataFeedWithCredentials(
+      userId,
+      sessionToken,
+      processIncomingTick,
+      setModule1OiDataSource,
+      (reason) => {
+        isConnecting = false;
+        console.warn(`[DataFeed] Feed disconnected: ${reason}`);
+        handleFeedDisconnect(reason, gen);
+      },
+      () => {
+        isConnecting = false;
+        handleSessionExpired(gen);
+      },
+      () => {
+        isConnecting = false;
+        // Called when the Zebu WebSocket actually connects and the handshake is sent.
+        // Only broadcast "live" at this point — not prematurely.
+        console.log("[DataFeed] Zebu WS open — broadcasting live status");
+        broadcastBrokerStatus("live", undefined, "module1");
+      },
+    );
+  } catch (err: any) {
+    isConnecting = false;
+    console.error("[DataFeed] startDataFeedWithCredentials unexpected failure:", err?.message || err);
   }
-
-  console.log(`[DataFeed] Starting live feed for user: ${userId}`);
-
-  zebuClient = startZebuMarketDataFeedWithCredentials(
-    userId,
-    sessionToken,
-    processIncomingTick,
-    setModule1OiDataSource,
-    (reason) => {
-      console.warn(`[DataFeed] Feed disconnected: ${reason}`);
-      handleFeedDisconnect(reason, gen);
-    },
-    () => handleSessionExpired(gen),
-    () => {
-      // Called when the Zebu WebSocket actually connects and the handshake is sent.
-      // Only broadcast "live" at this point — not prematurely.
-      console.log("[DataFeed] Zebu WS open — broadcasting live status");
-      broadcastBrokerStatus("live", undefined, "module1");
-    },
-  );
 };
+
+import { getActiveModule1SessionCount } from "./module1SessionService";
 
 /**
  * Stop the live feed and clear all state (called on explicit user logout or server shutdown).
+ * Hard safety guard: if active Module 1 sessions exist, shutdown is blocked unless forced (e.g. server termination).
  */
-export const stopDataFeed = () => {
+export const stopDataFeed = (force = false) => {
+  const activeCount = getActiveModule1SessionCount();
+  if (!force && activeCount > 0) {
+    console.warn(`[Module1/Broker] STOP_BLOCKED active=${activeCount}`);
+    return;
+  }
+
   // Invalidate any in-flight or pending disconnect callbacks
   connectionGeneration++;
   clearReconnectTimer();

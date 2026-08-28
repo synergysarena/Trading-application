@@ -10,6 +10,7 @@ import {
   getPutIndicator,
   getDivergence,
 } from "../utils/pivotEngine";
+import { isMarketDataProcessingEnabled } from "./marketDataLifecycle";
 import { Candle, PivotLevels, Module1Indicators } from "@stock/shared";
 
 // Local cache for the latest computed pivots: latestPivots[symbol][timeframe][method]
@@ -28,6 +29,7 @@ export const setOnPivotsUpdated = (callback: PivotsUpdatedCallback) => {
  */
 export const initPivotService = () => {
   setOnCandleFinalized(async (candle: Candle) => {
+    if (!isMarketDataProcessingEnabled()) return;
     console.log(`[PivotService] Finalized candle received for ${candle.symbol} (${candle.timeframe}). Recalculating pivots...`);
     await recalculatePivots(candle.symbol, candle.timeframe, candle.high, candle.low, candle.close);
   });
@@ -43,6 +45,7 @@ export const recalculatePivots = async (
   low: number,
   close: number
 ): Promise<Record<string, PivotLevels>> => {
+  if (!isMarketDataProcessingEnabled()) return {};
   const date = new Date();
   const computedAt = date;
 

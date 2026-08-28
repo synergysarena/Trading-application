@@ -57,6 +57,30 @@ function useResumeModule1Session(active: boolean, module1Token: string | null) {
   }, [active, setModule1Status]);
 }
 
+// ── Module 2 session-restore reconnection ──────────────────────────────────
+function useResumeModule2Session(active: boolean, module2Token: string | null) {
+  const hadTokenOnMount = useRef(module2Token !== null);
+  const fired = useRef(false);
+  const setModule2Status = useStore((s) => s.setModule2Status);
+
+  useEffect(() => {
+    if (!active || !hadTokenOnMount.current || fired.current) return;
+    fired.current = true;
+
+    setModule2Status("authenticating");
+    api.post("/auth/module2-resume-session")
+      .then((res: { result?: string }) => {
+        console.log(`[Module2/Lifecycle] Module 2 session resume: ${res?.result ?? "unknown"}`);
+        setModule2Status("authenticated");
+      })
+      .catch((err: any) => {
+        console.warn("[Module2/Lifecycle] Module 2 session resume failed:", err?.message || err);
+        setModule2Status("error", "Could not resume the previous broker session.");
+      });
+  }, [active, setModule2Status]);
+}
+
+
 const GREEN = "#047857";
 
 // Toggle SHOW_LIVE_INSTRUMENT_WATCH_TAB to true if client wants to re-enable "Live Instrument Watch" tab UI
@@ -98,6 +122,7 @@ export function ModuleWorkspace({ moduleId }: { moduleId: "module1" | "module2" 
   const module2Token = useStore((s) => s.module2Token);
 
   useResumeModule1Session(moduleId === "module1", module1Token);
+  useResumeModule2Session(moduleId === "module2", module2Token);
 
   if (moduleId === "module1") {
     if (!module1Token) return <Module1LoginPanel />;

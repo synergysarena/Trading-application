@@ -3,8 +3,12 @@ import { Tick, Candle } from "@stock/shared";
 import { readLive } from "./redisWriteBuffer";
 import { archiveModule1Candles } from "./module1ArchiveService";
 
+import { isMarketDataProcessingEnabled } from "./marketDataLifecycle";
+
 // Local cache for active candles: activeCandles[symbol][timeframe]
 const activeCandles: Record<string, Record<string, Candle>> = {};
+
+let boundaryInterval: NodeJS.Timeout | null = null;
 
 const parseTfMinutes = (tf: string): number => {
   if (tf.endsWith("h")) {
@@ -21,8 +25,6 @@ const parseTfMinutes = (tf: string): number => {
 const getTimeframeMinutes = async (tfStr: string): Promise<number> => {
   if (tfStr === "custom") {
     try {
-      // Memory-first: mirror hit after the first read/set; at most one Redis
-      // GET per process (restart warmup), instead of one per boundary check.
       const customTf = await readLive("config:custom_timeframe");
       if (customTf) {
         const mins = parseTfMinutes(customTf);
@@ -38,15 +40,19 @@ const getTimeframeMinutes = async (tfStr: string): Promise<number> => {
 };
 
 // Start a proactive checker loop on startup/module load
-const startBoundaryChecker = () => {
-  setInterval(async () => {
+export const startBoundaryChecker = () => {
+  if (boundaryInterval) return;
+  boundaryInterval = setInterval(async () => {
+    if (!isMarketDataProcessingEnabled()) return;
     const now = Date.now();
     for (const symbol of Object.keys(activeCandles)) {
       for (const tfStr of Object.keys(activeCandles[symbol])) {
+        if (!isMarketDataProcessingEnabled()) return;
         const candle = activeCandles[symbol][tfStr];
         if (!candle) continue;
 
         const tfMins = await getTimeframeMinutes(tfStr);
+        if (!isMarketDataProcessingEnabled()) return;
 
         // Re-check identity after the await: a tick may have finalized and
         // replaced this candle while getTimeframeMinutes yielded. Without this
@@ -57,6 +63,7 @@ const startBoundaryChecker = () => {
         const nextBoundary = candle.openTime + tfMins * 60000;
 
         if (now >= nextBoundary) {
+          if (!isMarketDataProcessingEnabled()) return;
           console.log(`[OHLC] Proactive finalization for ${symbol} (${tfStr}) on boundary.`);
           const candleToFinalize = candle;
           delete activeCandles[symbol][tfStr];
@@ -67,7 +74,22 @@ const startBoundaryChecker = () => {
   }, 1000);
 };
 
+export const stopBoundaryChecker = () => {
+  if (boundaryInterval) {
+    clearInterval(boundaryInterval);
+    boundaryInterval = null;
+  }
+};
+
 startBoundaryChecker();
+
+export const clearActiveCandles = (): void => {
+  stopBoundaryChecker();
+  persistQueue.length = 0;
+  for (const symbol of Object.keys(activeCandles)) {
+    delete activeCandles[symbol];
+  }
+};
 
 // Callback to trigger pivot calculations when a candle is finalized
 type CandleFinalizedCallback = (candle: Candle) => Promise<void> | void;
@@ -127,6 +149,18 @@ const MAX_DIAG_OHLC = 20;
  * Aggregates a raw tick into the corresponding timeframe candles for that symbol
  */
 export const aggregateOHLC = async (tick: Tick, timeframeMinutes: number, timeframeStr: string): Promise<Candle> => {
+  if (!isMarketDataProcessingEnabled()) {
+    return {
+      symbol: tick.symbol,
+      timeframe: timeframeStr,
+      open: tick.ltp,
+      high: tick.ltp,
+      low: tick.ltp,
+      close: tick.ltp,
+      openTime: getBoundaryTime(tick.timestamp, timeframeMinutes),
+      volume: tick.volume || 0,
+    };
+  }
   const { symbol, ltp, timestamp, volume = 0 } = tick;
   
   if (!activeCandles[symbol]) {
@@ -232,10 +266,14 @@ const sessionOpenForCandle = (openTimeMs: number): number => {
 };
 
 const drainPersistQueue = async () => {
-  if (draining) return;
+  if (draining || !isMarketDataProcessingEnabled()) return;
   draining = true;
   try {
     while (persistQueue.length > 0) {
+      if (!isMarketDataProcessingEnabled()) {
+        persistQueue.length = 0;
+        break;
+      }
       const batch = persistQueue.splice(0, persistQueue.length);
 
       // Async fire-and-forget archival to Module1CandleArchive
@@ -244,9 +282,11 @@ const drainPersistQueue = async () => {
       // 1. One bulk upsert for the whole batch (same doc shape/filter as the
       //    previous per-candle findOneAndUpdate upsert).
       try {
+        if (!isMarketDataProcessingEnabled()) break;
         await FuturesOHLC.bulkWrite(batch.map(candleToUpsertOp), { ordered: false });
         console.log(`[OHLC] Persisted ${batch.length} finalized candle(s) in one bulk write.`);
       } catch (error: any) {
+        if (!isMarketDataProcessingEnabled()) break;
         // E11000 duplicate key: two upserts raced on the same (symbol,
         // timeframe, bar_time) key and the unique index rejected the loser.
         // The doc now exists, so re-running the identical op is a plain
@@ -279,6 +319,7 @@ const drainPersistQueue = async () => {
       // Cutoff is a rolling 45-day window (matches the TTL index), not
       // "today's session open" — see HISTORY_RETENTION_MS above.
       for (const c of batch) {
+        if (!isMarketDataProcessingEnabled()) break;
         const key = `${c.symbol}|${c.timeframe}`;
         const sessionOpenMs = sessionOpenForCandle(c.openTime);
         if (prunedSessions.get(key) === sessionOpenMs) continue;
@@ -294,8 +335,9 @@ const drainPersistQueue = async () => {
 
       // 3. Pivot recalculation per finalized candle — unchanged semantics,
       //    now serialized so Mongo insert concurrency stays bounded.
-      if (onCandleFinalized) {
+      if (onCandleFinalized && isMarketDataProcessingEnabled()) {
         for (const c of batch) {
+          if (!isMarketDataProcessingEnabled()) break;
           try {
             await onCandleFinalized(c);
           } catch (err: any) {
@@ -319,6 +361,7 @@ const drainPersistQueue = async () => {
  * it immediately) and queues it for background persistence + pivot recalc.
  */
 const finaliseCandle = async (liveCandle: Candle) => {
+  if (!isMarketDataProcessingEnabled()) return;
   // Snapshot: the live object could still be mutated by a racing tick between
   // queueing and the background bulk write — cache and persist frozen values.
   const candle: Candle = { ...liveCandle };

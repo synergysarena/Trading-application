@@ -1,10 +1,18 @@
 import { Request, Response } from "express";
 import crypto from "crypto";
 import axios from "axios";
-import { startDataFeedWithCredentials, resumeDataFeedFromPersistedSession } from "../services/dataFeed";
+import { startDataFeedWithCredentials, resumeDataFeedFromPersistedSession, persistBrokerSession } from "../services/dataFeed";
+import { isZebuLiveConnected } from "../services/zebuMarketDataClient";
 import { loginToAetramWithCredentials } from "../services/aetramMarketDataService";
+import {
+  persistAetramBrokerSession,
+  resumeAetramFromPersistedSession,
+  getMarketDataSession,
+  isMarketDataAuthenticated,
+} from "../services/marketDataSessionService";
 import { connect as connectMarketDataWebSocket } from "../services/marketDataWebSocketService";
-import { generateAccessToken, JWT_SECRET } from "../utils/token";
+import { generateAccessToken, verifyAccessToken, JWT_SECRET } from "../utils/token";
+import { AuthenticatedRequest } from "../middleware/auth";
 import jwt from "jsonwebtoken";
 
 const sha256 = (data: string) => crypto.createHash("sha256").update(data).digest("hex");
@@ -123,11 +131,16 @@ export const module1BrokerLogin = async (req: Request, res: Response) => {
     const sessionToken = data.susertoken as string;
     console.log(`[Module1/BrokerLogin] SUCCESS — session token obtained (${sessionToken.length} chars).`);
 
-    // ── Start live data feed (async — runs in background, does not block response) ─
-    console.log("[Module1/BrokerLogin] Starting live data feed (async)...");
-    startDataFeedWithCredentials(userId, sessionToken).catch((err) => {
-      console.error("[Module1/BrokerLogin] Feed start error:", err?.message || err);
-    });
+    // ── Manage live data feed: start if offline, reuse singleton if already running ─
+    if (isZebuLiveConnected()) {
+      console.log("[Module1/BrokerLogin] Zebu live feed is already active — reusing shared connection.");
+      persistBrokerSession(userId, sessionToken);
+    } else {
+      console.log("[Module1/BrokerLogin] Starting live data feed (async)...");
+      startDataFeedWithCredentials(userId, sessionToken).catch((err) => {
+        console.error("[Module1/BrokerLogin] Feed start error:", err?.message || err);
+      });
+    }
 
     // ── Issue module JWT ─────────────────────────────────────────────────────
     const moduleToken = jwt.sign(
@@ -172,11 +185,24 @@ export const module1ResumeSession = async (req: Request, res: Response) => {
 export const module2BrokerLogin = async (req: Request, res: Response) => {
   console.log("\n[Module2/BrokerLogin] ─────────────────────────────────────");
   console.log("[Module2/BrokerLogin] Route entered.");
-  console.log("[Module2/BrokerLogin] Request body keys:", Object.keys(req.body));
 
   try {
-    // End-user inputs: username (or userId), password, otp (or factor2)
-    const username = (req.body.username || req.body.userId || req.body.appKey || "").trim();
+    // Identity must come strictly from authenticated application session
+    let userId = (req as AuthenticatedRequest).user?.id;
+    if (!userId && req.headers.authorization?.startsWith("Bearer ")) {
+      try {
+        const decoded = verifyAccessToken(req.headers.authorization.split(" ")[1]);
+        userId = decoded.userId;
+      } catch {}
+    }
+
+    if (!userId) {
+      console.warn("[Module2/BrokerLogin] Rejected: No authenticated application session found.");
+      return res.status(401).json({ error: "Unauthorized. You must be logged in to the application to connect a broker account." });
+    }
+
+    // End-user inputs: username, password, otp
+    const username = (req.body.username || req.body.appKey || "").trim();
     const password = (req.body.password || req.body.secretKey || "").trim();
     const otp = (req.body.otp || req.body.factor2 || "").trim();
 
@@ -195,8 +221,9 @@ export const module2BrokerLogin = async (req: Request, res: Response) => {
       return res.status(500).json({ error: "Backend Aetram API configuration is incomplete." });
     }
 
-    console.log(`[Module2/BrokerLogin] Username : ${username}`);
-    console.log(`[Module2/BrokerLogin] OTP      : ${"*".repeat(otp.length || 6)}`);
+    console.log(`[Module2/BrokerLogin] App User ID: ${userId}`);
+    console.log(`[Module2/BrokerLogin] Broker User: ${username}`);
+    console.log(`[Module2/BrokerLogin] OTP        : ${"*".repeat(otp.length || 6)}`);
 
     console.log("[Module2/BrokerLogin] Authenticating with Aetram using environment credentials...");
     const result = await loginToAetramWithCredentials(appKey, secretKey);
@@ -210,20 +237,58 @@ export const module2BrokerLogin = async (req: Request, res: Response) => {
       });
     }
 
+    // Persist broker session for this user in Redis (8h TTL) for seamless reloads/multi-tab resume
+    const currentSession = getMarketDataSession();
+    if (currentSession) {
+      persistAetramBrokerSession(userId, currentSession);
+    }
+
     console.log("[Module2/BrokerLogin] Aetram auth success. Connecting WebSocket...");
     await connectMarketDataWebSocket();
 
     const moduleToken = jwt.sign(
-      { moduleId: "module2", type: "module-access", username },
+      { moduleId: "module2", userId, type: "module-access", username },
       JWT_SECRET,
       { expiresIn: "8h" }
     );
 
     console.log("[Module2/BrokerLogin] Module JWT issued. Login complete.\n");
-    return res.status(200).json({ moduleToken, moduleId: "module2" });
+    return res.status(200).json({ moduleToken, moduleId: "module2", userId });
 
   } catch (error: any) {
     console.error("[Module2/BrokerLogin] Unexpected error:", error?.message || error);
     return res.status(500).json({ error: "Module 2 authentication failed. Please try again." });
   }
 };
+
+/**
+ * Resumes an active Aetram session from user-scoped Redis persistence without requiring
+ * re-entering credentials (fired when returning with a cached module2Token).
+ */
+export const module2ResumeSession = async (req: Request, res: Response) => {
+  try {
+    let userId = (req as AuthenticatedRequest).user?.id;
+    if (!userId && req.headers.authorization?.startsWith("Bearer ")) {
+      try {
+        const decoded = verifyAccessToken(req.headers.authorization.split(" ")[1]);
+        userId = decoded.userId;
+      } catch {}
+    }
+
+    if (!userId) {
+      return res.status(401).json({ error: "Unauthorized. Valid application session required." });
+    }
+
+    const result = await resumeAetramFromPersistedSession(userId);
+    if (result === "resumed") {
+      await connectMarketDataWebSocket();
+    }
+
+    console.log(`[Module2/ResumeSession] User=${userId} Result=${result}`);
+    return res.status(200).json({ result });
+  } catch (error: any) {
+    console.error("[Module2/ResumeSession] Unexpected error:", error?.message || error);
+    return res.status(500).json({ error: "Failed to resume Module 2 session." });
+  }
+};
+

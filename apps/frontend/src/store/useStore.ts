@@ -99,8 +99,10 @@ export const useStore = create<AppState>((set) => ({
   accessToken: null,
   setAuth: (user, token) => set({ user, accessToken: token }),
   clearAuth: () => {
-    sessionStorage.removeItem("m1_token");
-    sessionStorage.removeItem("m2_token");
+    if (typeof sessionStorage !== "undefined") {
+      sessionStorage.removeItem("m1_token");
+      sessionStorage.removeItem("m2_token");
+    }
     set({
       user: null,
       accessToken: null,
@@ -128,18 +130,23 @@ export const useStore = create<AppState>((set) => ({
   setModule1IndicatorRoom: (room) => set({ module1IndicatorRoom: room }),
 
   // Module token state
-  module1Token: sessionStorage.getItem("m1_token") || null,
-  module2Token: sessionStorage.getItem("m2_token") || null,
+  module1Token: typeof sessionStorage !== "undefined" ? sessionStorage.getItem("m1_token") || null : null,
+  module2Token: typeof sessionStorage !== "undefined" ? sessionStorage.getItem("m2_token") || null : null,
   setModule1Token: (token) => {
-    if (token) sessionStorage.setItem("m1_token", token);
-    else sessionStorage.removeItem("m1_token");
+    if (typeof sessionStorage !== "undefined") {
+      if (token) sessionStorage.setItem("m1_token", token);
+      else sessionStorage.removeItem("m1_token");
+    }
     set({ module1Token: token });
   },
   setModule2Token: (token) => {
-    if (token) sessionStorage.setItem("m2_token", token);
-    else sessionStorage.removeItem("m2_token");
+    if (typeof sessionStorage !== "undefined") {
+      if (token) sessionStorage.setItem("m2_token", token);
+      else sessionStorage.removeItem("m2_token");
+    }
     set({ module2Token: token });
   },
+
 
   // Module connection status
   module1Status: "idle",

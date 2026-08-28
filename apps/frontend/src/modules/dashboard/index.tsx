@@ -857,10 +857,8 @@ export function Dashboard() {
     timeframe === "custom" && !customRange ? "custom-pending" :
     feedStatus === "auth-error"         ? "auth-error"         :
     feedStatus === "session-expired"    ? "session-expired"    :
-    feedStatus === "broker-disconnected"? "broker-disconnected":
-    feedStatus === "reconnecting"       ? "reconnecting"       :
-    feedStatus === "api-error"          ? "api-error"          :
-    feedStatus === "no-network"         ? "no-network"         : null;
+    feedStatus === "broker-disconnected" && rows.length === 0 ? "broker-disconnected":
+    (feedStatus === "reconnecting" || feedStatus === "no-network" || feedStatus === "api-error") && rows.length === 0 ? feedStatus : null;
 
   return (
     <div style={{

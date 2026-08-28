@@ -6,6 +6,11 @@ import { Tick, PivotLevels } from "@stock/shared";
 import { getLatestModule1OiMetrics } from "./module1OiService";
 import { isZebuLiveConnected } from "./zebuMarketDataClient";
 import { resolveOptionInstrument } from "./instrumentTokenService";
+import {
+  registerModule1Session,
+  removeModule1SessionBySocket,
+  touchModule1Session,
+} from "./module1SessionService";
 
 let ioServer: Server | null = null;
 
@@ -53,6 +58,9 @@ export const initSocketServer = (io: Server) => {
   io.on("connection", (socket: Socket) => {
     console.log(`[Socket] Client connected: ${socket.id} (User: ${socket.data.userId})`);
 
+    // Register active Module 1 session in the session registry
+    registerModule1Session(socket.data.userId, socket.id);
+
     // Send initial latest OI metrics immediately on connection
     socket.emit("latest-oi", getLatestModule1OiMetrics());
 
@@ -71,11 +79,13 @@ export const initSocketServer = (io: Server) => {
 
     // 1. Join room to receive raw price ticks for a specific symbol
     socket.on("join:symbol", (symbol: string) => {
+      touchModule1Session(socket.id);
       socket.join(`market:${symbol}`);
       console.log(`[Socket] Client ${socket.id} subscribed to market ticks: ${symbol}`);
     });
 
     socket.on("leave:symbol", (symbol: string) => {
+      touchModule1Session(socket.id);
       socket.leave(`market:${symbol}`);
       console.log(`[Socket] Client ${socket.id} unsubscribed from market ticks: ${symbol}`);
     });
@@ -85,6 +95,7 @@ export const initSocketServer = (io: Server) => {
     socket.on(
       "subscribe:options",
       async (data: { instrument: string; expiry: string; callStrike?: number | null; putStrike?: number | null; type: string }) => {
+        touchModule1Session(socket.id);
         const { instrument, expiry, callStrike, putStrike, type } = data || ({} as typeof data);
         if (!instrument || !expiry) {
           console.warn(`[Socket] subscribe:options from ${socket.id} missing instrument/expiry — ignored: ${JSON.stringify(data)}`);
@@ -119,6 +130,7 @@ export const initSocketServer = (io: Server) => {
     socket.on(
       "join:indicators",
       async (data: { symbol: string; timeframe: string; method: "classic" | "camarilla" | "fibonacci" }) => {
+        touchModule1Session(socket.id);
         const { symbol, timeframe, method } = data;
         const roomName = `indicators:${symbol}:${timeframe}:${method}`;
         socket.join(roomName);
@@ -135,6 +147,7 @@ export const initSocketServer = (io: Server) => {
     socket.on(
       "leave:indicators",
       (data: { symbol: string; timeframe: string; method: "classic" | "camarilla" | "fibonacci" }) => {
+        touchModule1Session(socket.id);
         const { symbol, timeframe, method } = data;
         const roomName = `indicators:${symbol}:${timeframe}:${method}`;
         socket.leave(roomName);
@@ -144,17 +157,20 @@ export const initSocketServer = (io: Server) => {
 
     // 3. Join room to receive option strike per-minute tracker updates
     socket.on("join:tracker", (sessionId: string) => {
+      touchModule1Session(socket.id);
       socket.join(`tracker:${sessionId}`);
       console.log(`[Socket] Client ${socket.id} subscribed to option tracker session: ${sessionId}`);
     });
 
     socket.on("leave:tracker", (sessionId: string) => {
+      touchModule1Session(socket.id);
       socket.leave(`tracker:${sessionId}`);
       console.log(`[Socket] Client ${socket.id} unsubscribed from option tracker session: ${sessionId}`);
     });
 
     socket.on("disconnect", () => {
       console.log(`[Socket] Client disconnected: ${socket.id}`);
+      removeModule1SessionBySocket(socket.id);
     });
   });
 
@@ -272,3 +288,19 @@ export const broadcastBrokerStatus = (
   ioServer.emit("broker_status", { status, moduleId, detail, timestamp: new Date().toISOString() });
   console.log(`[Socket] Broadcast broker_status[${moduleId}]: ${status}${detail ? ` (${detail})` : ""}`);
 };
+
+/**
+ * Broadcasts global market-data shutdown event to every connected client tab.
+ */
+export const broadcastGlobalShutdown = (reason = "Global market-data shutdown") => {
+  if (!ioServer) return;
+  const payload = {
+    type: "GLOBAL_SHUTDOWN",
+    reason,
+    timestamp: new Date().toISOString(),
+  };
+  ioServer.emit("GLOBAL_SHUTDOWN", payload);
+  ioServer.emit("market_data_global_shutdown", payload);
+  console.log(`[Socket] Broadcast GLOBAL_SHUTDOWN to all connected clients (reason: ${reason})`);
+};
+

@@ -29,6 +29,8 @@ export const ModuleSelection: React.FC = () => {
   const user      = useStore((s) => s.user);
   const module1Token = useStore((s) => s.module1Token);
   const module2Token = useStore((s) => s.module2Token);
+  const setModule1Token = useStore((s) => s.setModule1Token);
+  const setModule2Token = useStore((s) => s.setModule2Token);
 
   const { data: moduleStatus } = useQuery<ModuleStatus>({
     queryKey: ["module-status"],
@@ -202,11 +204,11 @@ export const ModuleSelection: React.FC = () => {
                   {mod.token && (
                     <button
                       onClick={() => {
-                        // Clear the module token and navigate back to show login panel
+                        // Clear the module token for this tab and navigate back to show login panel
                         if (mod.id === "module1") {
-                          useStore.setState({ module1Token: null });
+                          setModule1Token(null);
                         } else {
-                          useStore.setState({ module2Token: null });
+                          setModule2Token(null);
                         }
                         navigate(mod.dashboardPath);
                       }}
@@ -214,6 +216,8 @@ export const ModuleSelection: React.FC = () => {
                       Switch credentials
                     </button>
                   )}
+
+
                 </div>
               </div>
             ))}

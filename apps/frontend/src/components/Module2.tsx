@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { useStore } from "../store/useStore";
 import { api } from "../utils/api";
@@ -368,6 +368,7 @@ export const Module2 = ({ isSplit = false }: { isSplit?: boolean }) => {
   const module2BrokerStatus = useStore((s) => s.module2BrokerStatus);
   const [isConfigExpanded, setIsConfigExpanded] = useState(!isSplit);
 
+
   const [indexSymbol, setIndexSymbol] = useState("NIFTY50");
   const [expiryDate, setExpiryDate] = useState("");
   const [selectedStrikes, setSelectedStrikes] = useState<string[]>([]);
@@ -680,12 +681,16 @@ export const Module2 = ({ isSplit = false }: { isSplit?: boolean }) => {
   const sessionDataSource = currentSession?.dataSource || "UNAVAILABLE";
   const isLiveInteractive = sessionDataSource === "LIVE_INTERACTIVE_API";
 
-  const sortedTimestamps = (() => {
+  const sortedTimestamps = useMemo(() => {
     if (!currentSession?.strikes) return [];
     const tsSet = new Set<string>();
-    Object.values(currentSession.strikes).forEach((s: any) => { s.grid.forEach((c: any) => { if (c.timestamp) tsSet.add(c.timestamp); }); });
-    return Array.from(tsSet).sort();
-  })();
+    Object.values(currentSession.strikes).forEach((s: any) => {
+      s.grid?.forEach((c: any) => {
+        if (c.timestamp) tsSet.add(c.timestamp);
+      });
+    });
+    return Array.from(tsSet).sort((a, b) => a.localeCompare(b));
+  }, [currentSession?.strikes]);
 
   // All selected strikes are displayed always
   const allSelectedStrikes: string[] = currentSession?.selectedStrikes || [];
@@ -840,6 +845,8 @@ export const Module2 = ({ isSplit = false }: { isSplit?: boolean }) => {
               </div>
             </div>
           )}
+
+
 
           {/* Broker status banner */}
           {module2BrokerStatus === "session-expired" && (
@@ -1227,6 +1234,8 @@ function StrikeTrackerTable({
   isClosed?: boolean;
 }) {
   const [showFullColumns, setShowFullColumns] = useState(false);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const wasAtEndRef = useRef<boolean>(true);
   const cellPadding = isSplit ? "10px 12px" : "12px 16px";
   const cellFontSize = "24px";
 
@@ -1237,6 +1246,21 @@ function StrikeTrackerTable({
   const displayedStrikes = showFullColumns || !isSplit
     ? strikesList
     : strikesList.slice(0, 5);
+
+  const handleScroll = useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const isAtEnd = el.scrollWidth - el.scrollLeft - el.clientWidth <= 60;
+    wasAtEndRef.current = isAtEnd;
+  }, []);
+
+  useEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    if (wasAtEndRef.current) {
+      el.scrollLeft = el.scrollWidth;
+    }
+  }, [displayedTimestamps.length, displayedTimestamps[displayedTimestamps.length - 1]]);
 
   const activeOHLCCols = ALL_OHLC_COLS.filter((c) => selectedOHLCFields.includes(c.id));
 
@@ -1265,7 +1289,11 @@ function StrikeTrackerTable({
         boxShadow: "0 1px 8px rgba(0,0,0,0.05)",
       }}
     >
-      <div style={{ overflowX: "auto", overflowY: "visible" }}>
+      <div
+        ref={scrollContainerRef}
+        onScroll={handleScroll}
+        style={{ overflowX: "auto", overflowY: "visible" }}
+      >
         <table style={{ 
           width: "100%", 
           minWidth: isSplit && showFullColumns ? "1450px" : "100%", 

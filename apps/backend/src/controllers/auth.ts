@@ -7,7 +7,7 @@ import { LoginSchema, RegisterSchema } from "@stock/shared";
 import { generateAccessToken, generateRefreshToken, verifyRefreshToken } from "../utils/token";
 import redis from "../config/redis";
 import { AuthenticatedRequest, markTokenRevoked } from "../middleware/auth";
-import { stopDataFeed } from "../services/dataFeed";
+
 
 // Fixed user ID issued inside JWTs when authenticating via APP_LOGIN_* env vars.
 // Used by refresh and me to bypass the database lookup for this synthetic user.
@@ -334,9 +334,9 @@ export const logout = async (req: Request, res: Response) => {
       } catch (_) {}
     }
 
-    // Stop the Zebu data feed so the backend is in a clean state before the
-    // next login. Any pending reconnect timers or stale callbacks are discarded.
-    stopDataFeed();
+    const userId = (req as AuthenticatedRequest).user?.id || "unknown";
+    const socketId = (req.headers["x-socket-id"] as string) || "unknown";
+    console.log(`[Logout] REQUEST socket=${socketId} user=${userId}`);
 
     res.clearCookie("refresh", {
       httpOnly: true,

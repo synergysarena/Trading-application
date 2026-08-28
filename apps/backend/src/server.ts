@@ -21,6 +21,7 @@ import authRouter from "./routes/auth";
 import marketRouter from "./routes/market";
 import trackerRouter from "./routes/tracker";
 import module2Router from "./routes/module2";
+import systemRouter from "./routes/system";
 import { getZebuOAuthStatusEndpoint, zebuOAuthCallback } from "./controllers/zebuOAuth";
 import { initPivotService } from "./services/pivotService";
 import { initSocketServer } from "./services/socketService";
@@ -35,6 +36,7 @@ import { initMarketBroadcast } from "./services/marketBroadcastService";
 import { initModule1OiService } from "./services/module1OiService";
 import { startMonitoringLoop, stopMonitoringLoop, getMonitoringStatus } from "./services/monitoringService";
 import { stopDataFeed } from "./services/dataFeed";
+import { stopSessionManager } from "./services/module1SessionService";
 
 const app = express();
 const server = http.createServer(app);
@@ -153,6 +155,8 @@ app.use("/api/auth", authRouter);
 
 // Mount market and tracker routers
 app.use("/api", marketRouter);
+app.use("/api", systemRouter);
+app.use("/system", systemRouter);
 app.use("/api/module2", trackerRouter);
 app.use("/api/module2", module2Router);
 // Dual mount (same pattern as /auth ↔ /api/auth) so Module 2 auth endpoints are
@@ -371,7 +375,8 @@ const shutdown = (signal: string) => {
   server.close(async () => {
     console.log("[Server] HTTP server closed.");
     stopMonitoringLoop();
-    stopDataFeed();
+    stopSessionManager();
+    stopDataFeed(true);
     try {
       const mongoose = require("mongoose");
       await mongoose.connection.close();

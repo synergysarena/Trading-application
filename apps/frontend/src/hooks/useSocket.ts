@@ -14,10 +14,9 @@ function parseIndicatorRoom(room: string): { symbol: string; timeframe: string; 
   return { symbol: parts[1], timeframe: parts[2], method: parts[3] };
 }
 
-// Module-level stable socket singleton to prevent duplicate creation
-// or teardown across re-renders and token rotations.
 let globalSocket: Socket | null = null;
 let isExplicitlyDisconnected = false;
+export const getGlobalSocket = () => globalSocket;
 
 export const useSocket = () => {
   const socketRef = useRef<Socket | null>(globalSocket);
@@ -290,7 +289,6 @@ export const useSocket = () => {
             dash.setFeedStatus("reconnecting");
             break;
           case "broker-disconnected":
-            // Only set broker-disconnected if not in the middle of fresh connect loading
             if (dash.feedStatus !== "connecting" || dash.rows.length > 0) {
               dash.setFeedStatus("broker-disconnected");
             }
@@ -300,6 +298,39 @@ export const useSocket = () => {
             break;
         }
       });
+
+      // Global market data shutdown broadcast handler
+      const handleGlobalShutdownEvent = (payload: any) => {
+        console.log("[Global/Socket] Received GLOBAL_SHUTDOWN event:", payload);
+        sessionStorage.removeItem("m1_token");
+        sessionStorage.removeItem("m2_token");
+        const store = useStore.getState();
+        store.setModule1Token(null);
+        store.setModule2Token(null);
+        store.setModule1Status("idle");
+        store.setModule2Status("idle");
+        store.setModule2BrokerStatus("broker-disconnected");
+
+        const dash = useDashStore.getState();
+        dash.setFeedStatus("broker-disconnected");
+
+        // Broadcast cross-tab fallback via BroadcastChannel
+        if (typeof BroadcastChannel !== "undefined") {
+          try {
+            const bc = new BroadcastChannel("tradepro_global_channel");
+            bc.postMessage({ type: "GLOBAL_SHUTDOWN" });
+            bc.close();
+          } catch {}
+        }
+
+        // If on a module page, navigate to Module Selection
+        if (window.location.pathname.includes("/dashboard/module-")) {
+          window.location.href = "/dashboard";
+        }
+      };
+
+      socket.on("GLOBAL_SHUTDOWN", handleGlobalShutdownEvent);
+      socket.on("market_data_global_shutdown", handleGlobalShutdownEvent);
     }
 
     // Do NOT disconnect socket on effect cleanup when accessToken hasn't been cleared
