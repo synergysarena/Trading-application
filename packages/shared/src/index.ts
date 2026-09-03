@@ -109,6 +109,10 @@ export interface Module2SessionData {
   selectedStrikes: string[];
   dayOpenPrices: Record<string, number>;
   strikes: Record<string, Module2StrikeState>;
+  status?: "ACTIVE" | "STOPPED";
+  startedAt?: Date;
+  stoppedAt?: Date | null;
+  strikeStartBoundaries?: Record<string, string>;
   createdAt: Date;
   futuresOI?: {
     symbol: string;

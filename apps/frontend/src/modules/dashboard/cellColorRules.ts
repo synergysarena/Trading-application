@@ -113,10 +113,7 @@ export function colorClassStyle(cls: ColorClass, theme: ColorTheme = "light"): C
 // SMC/FIB render as "<LABEL> <formatted price>" (see calc/index.ts
 // smcNearest / nearestFibLabel — e.g. "SWH 23,456.00" or "23.6% 23,456.00").
 // The color engine needs a plain number to track against; this pulls the
-// trailing formatted price back out of the label. Mirrors every other
-// tracked column, where the color reads the raw underlying number and the
-// rendered text is a separate, independent concern (e.g. MMA/TLA are
-// truncated for display via p0() but colored from the untruncated value).
+// trailing formatted price back out of the label.
 function parseTrailingNumber(label: string): number | null {
   const match = label.match(/(-?[\d,]+\.\d+)\s*$/);
   if (!match) return null;
@@ -127,14 +124,6 @@ function parseTrailingNumber(label: string): number | null {
 interface TrackedColumnDef {
   accessor: (row: DashboardRow) => number | null | undefined;
   theme: ColorTheme;
-  // Whether to compare the truncateForDisplay()'d value instead of the raw
-  // one — true for every column whose cell text is p0()/fmtVwap() (both
-  // Math.trunc), so "looks unchanged" and "no color" always agree. false for
-  // smc/fib (parseTrailingNumber already reads the *already-rounded* 2-decimal
-  // label text — truncating again would throw away real display precision)
-  // and ema (the cell shows a CALL/PUT/NEUTRAL label, not a number at all, so
-  // there's no displayed digit for the color to stay consistent with).
-  truncateForColor: boolean;
 }
 
 // Every applicable column, mapped to how to read its value off a
@@ -144,46 +133,45 @@ interface TrackedColumnDef {
 // entry here; nothing else changes.
 const TRACKED_COLUMNS: Record<string, TrackedColumnDef> = {
   // Group A — Call/Put/Future/Spot Open/High/Low/Close (light green/pink, dark blue/black)
-  "ce-o": { accessor: (r) => r.call.o, theme: "hlc", truncateForColor: true },
-  "ce-h": { accessor: (r) => r.call.h, theme: "hlc", truncateForColor: true },
-  "ce-l": { accessor: (r) => r.call.l, theme: "hlc", truncateForColor: true },
-  "ce-c": { accessor: (r) => r.call.c, theme: "hlc", truncateForColor: true },
-  "pe-o": { accessor: (r) => r.put.o, theme: "hlc", truncateForColor: true },
-  "pe-h": { accessor: (r) => r.put.h, theme: "hlc", truncateForColor: true },
-  "pe-l": { accessor: (r) => r.put.l, theme: "hlc", truncateForColor: true },
-  "pe-c": { accessor: (r) => r.put.c, theme: "hlc", truncateForColor: true },
-  "fut-o": { accessor: (r) => r.future.o, theme: "hlc", truncateForColor: true },
-  "fut-h": { accessor: (r) => r.future.h, theme: "hlc", truncateForColor: true },
-  "fut-l": { accessor: (r) => r.future.l, theme: "hlc", truncateForColor: true },
-  "fut-c": { accessor: (r) => r.future.c, theme: "hlc", truncateForColor: true },
-  "spot-o": { accessor: (r) => r.spot.o, theme: "hlc", truncateForColor: true },
-  "spot-h": { accessor: (r) => r.spot.h, theme: "hlc", truncateForColor: true },
-  "spot-l": { accessor: (r) => r.spot.l, theme: "hlc", truncateForColor: true },
-  "spot-c": { accessor: (r) => r.spot.c, theme: "hlc", truncateForColor: true },
+  "ce-o": { accessor: (r) => r.call.o, theme: "hlc" },
+  "ce-h": { accessor: (r) => r.call.h, theme: "hlc" },
+  "ce-l": { accessor: (r) => r.call.l, theme: "hlc" },
+  "ce-c": { accessor: (r) => r.call.c, theme: "hlc" },
+  "pe-o": { accessor: (r) => r.put.o, theme: "hlc" },
+  "pe-h": { accessor: (r) => r.put.h, theme: "hlc" },
+  "pe-l": { accessor: (r) => r.put.l, theme: "hlc" },
+  "pe-c": { accessor: (r) => r.put.c, theme: "hlc" },
+  "fut-o": { accessor: (r) => r.future.o, theme: "hlc" },
+  "fut-h": { accessor: (r) => r.future.h, theme: "hlc" },
+  "fut-l": { accessor: (r) => r.future.l, theme: "hlc" },
+  "fut-c": { accessor: (r) => r.future.c, theme: "hlc" },
+  "spot-o": { accessor: (r) => r.spot.o, theme: "hlc" },
+  "spot-h": { accessor: (r) => r.spot.h, theme: "hlc" },
+  "spot-l": { accessor: (r) => r.spot.l, theme: "hlc" },
+  "spot-c": { accessor: (r) => r.spot.c, theme: "hlc" },
   // SPACE = C Sign − P Sign (C Sign = callMMA−callTMA, P Sign = putMMA−putTMA)
   // — reuses the same OHLC "hlc" theme/engine per spec, not a new color rule.
-  "space": { accessor: (r) => (r.callMMA - r.callTMA) - (r.putMMA - r.putTMA), theme: "hlc", truncateForColor: true },
+  "space": { accessor: (r) => (r.callMMA - r.callTMA) - (r.putMMA - r.putTMA), theme: "hlc" },
 
   // Group B — Call/Put/Future/Spot MA/TMA (dark theme). C Sign / P Sign now
   // use this same engine (client spec update) instead of their prior fixed
   // Dark-Green/Black rule.
-  "mma-c": { accessor: (r) => r.callMMA, theme: "dark", truncateForColor: true },
-  "tla-c": { accessor: (r) => r.callTMA, theme: "dark", truncateForColor: true },
-  "mma-p": { accessor: (r) => r.putMMA, theme: "dark", truncateForColor: true },
-  "tla-p": { accessor: (r) => r.putTMA, theme: "dark", truncateForColor: true },
-  "fut-mma": { accessor: (r) => r.futureMMA, theme: "dark", truncateForColor: true },
-  "fut-tla": { accessor: (r) => r.futureTMA, theme: "dark", truncateForColor: true },
-  "spot-mma": { accessor: (r) => r.spotMMA, theme: "dark", truncateForColor: true },
-  "spot-tla": { accessor: (r) => r.spotTMA, theme: "dark", truncateForColor: true },
-  "c-sign": { accessor: (r) => r.callMMA - r.callTMA, theme: "dark", truncateForColor: true },
-  "p-sign": { accessor: (r) => r.putMMA - r.putTMA, theme: "dark", truncateForColor: true },
+  "mma-c": { accessor: (r) => r.callMMA, theme: "dark" },
+  "tla-c": { accessor: (r) => r.callTMA, theme: "dark" },
+  "mma-p": { accessor: (r) => r.putMMA, theme: "dark" },
+  "tla-p": { accessor: (r) => r.putTMA, theme: "dark" },
+  "fut-mma": { accessor: (r) => r.futureMMA, theme: "dark" },
+  "fut-tla": { accessor: (r) => r.futureTMA, theme: "dark" },
+  "spot-mma": { accessor: (r) => r.spotMMA, theme: "dark" },
+  "spot-tla": { accessor: (r) => r.spotTMA, theme: "dark" },
+  "c-sign": { accessor: (r) => r.callMMA - r.callTMA, theme: "dark" },
+  "p-sign": { accessor: (r) => r.putMMA - r.putTMA, theme: "dark" },
 
-  // Group C — Indicators (dark theme)
-  "smc": { accessor: (r) => parseTrailingNumber(r.smc), theme: "dark", truncateForColor: false },
-  "fib": { accessor: (r) => parseTrailingNumber(r.fib), theme: "dark", truncateForColor: false },
-  "rsi": { accessor: (r) => r.rsi, theme: "dark", truncateForColor: true },
-  "ema": { accessor: (r) => r.ema, theme: "dark", truncateForColor: false }, // raw EMA-20 value — the column itself renders a CALL/PUT/NEUTRAL label, but color tracks the underlying number, same pattern as every other column
-  "vwap": { accessor: (r) => r.vwap, theme: "dark", truncateForColor: true },
+  "smc": { accessor: (r) => parseTrailingNumber(r.smc), theme: "dark" },
+  "fib": { accessor: (r) => parseTrailingNumber(r.fib), theme: "dark" },
+  "rsi": { accessor: (r) => r.rsi, theme: "dark" },
+  "ema": { accessor: (r) => r.ema, theme: "dark" }, // raw EMA-20 value — the column itself renders a CALL/PUT/NEUTRAL label, but color tracks the underlying number, same pattern as every other column
+  "vwap": { accessor: (r) => r.vwap, theme: "dark" },
 };
 
 export const TRACKED_COLUMN_ACCESSORS: Record<string, (row: DashboardRow) => number | null | undefined> =
@@ -207,7 +195,24 @@ const MA_TMA_PAIR_IDS: Record<string, string> = {
   "spot-tla": "spot-mma",
 };
 
-function nextColorStep(
+// Pure step function: computes the color class and updated running-highest /
+// running-lowest for a single cell given its current value, the previous
+// row's value, and the highest / lowest values observed before this row.
+//
+// Rules (all column groups):
+//   1. Row 0 (prevValue === null) -> null (no color).
+//   2. current >= prevValue (Green or Blue):
+//        isNewHigh = highestBefore === null || current > highestBefore
+//        isNewHigh -> "blue" (running highest)
+//        else      -> "green" (up or equal, not highest)
+//   3. current < prevValue (Pink or Black):
+//        isNewLow  = lowestBefore === null || current < lowestBefore
+//        isNewLow  -> "black" (running lowest)
+//        else      -> "pink" (down, not lowest)
+//
+// The palette (light vs hlc vs dark) is applied at render time via
+// colorClassStyle(cls, theme) — this calculation is identical across all columns.
+export function nextColorStep(
   current: number,
   prevValue: number | null,
   highestBefore: number | null,
@@ -247,10 +252,7 @@ export function buildLiveColorGrid(rows: DashboardRow[]): Record<string, ColorCl
   for (const [colId, def] of Object.entries(TRACKED_COLUMNS)) {
     const values: Array<number | null> = new Array(rows.length).fill(null);
     for (let i = 0; i < rows.length; i++) {
-      let raw = def.accessor(rows[i]);
-      if (def.truncateForColor && typeof raw === "number" && Number.isFinite(raw)) {
-        raw = truncateForDisplay(raw);
-      }
+      const raw = def.accessor(rows[i]);
       values[i] = typeof raw === "number" && Number.isFinite(raw) ? raw : null;
     }
     normalizedValuesByColId[colId] = values;

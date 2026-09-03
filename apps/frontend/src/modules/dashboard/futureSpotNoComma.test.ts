@@ -81,3 +81,59 @@ describe("Future/Spot OHLC render without thousands separator", () => {
     expect(html).toMatch(/>80000</); // Future/Spot TMA
   });
 });
+
+describe("Table visible cells display whole numbers while title tooltips show original decimals", () => {
+  function mkDecimalRow(t: number): DashboardRow {
+    return {
+      t,
+      call: { t, o: 1.85, h: 1.95, l: 1.2, c: 1.45 },
+      put: { t, o: 79.4, h: 515.25, l: 0.6, c: 79.4 },
+      future: flatBar(t, 24213.75), spot: flatBar(t, 24213.75),
+      callMMA: 1.61, callTMA: 1.58,
+      putMMA: 168.66, putTMA: 150.2,
+      futureMMA: 24210, futureTMA: 24210,
+      spotMMA: 24210, spotTMA: 24210,
+      ranking: 168.66, rankingWinner: "put",
+      smc: "—", fib: "—", rsi: null, ema: null, vwap: null,
+      ema200: null, emaScore: null, vwapScore: null, totalScore: null,
+      rating: null, signal: null,
+      oiMatrix: null,
+    };
+  }
+
+  const html = render([mkDecimalRow(Date.UTC(2026, 6, 20, 4, 0))]);
+
+  it("Visible table cells show only whole numbers via Math.trunc", () => {
+    // Call OHLC (1.85, 1.95, 1.2, 1.45) all display as 1
+    const callOpenCell = html.match(/<td[^>]*title="1\.85"[^>]*>1<\/td>/);
+    expect(callOpenCell).not.toBeNull();
+    const callHighCell = html.match(/<td[^>]*title="1\.95"[^>]*>1<\/td>/);
+    expect(callHighCell).not.toBeNull();
+
+    // Put Open (79.4) displays as 79, High (515.25) displays as 515, Low (0.6) displays as 0
+    expect(html).toMatch(/<td[^>]*title="79\.4"[^>]*>79<\/td>/);
+    expect(html).toMatch(/<td[^>]*title="515\.25"[^>]*>515<\/td>/);
+    expect(html).toMatch(/<td[^>]*title="0\.6"[^>]*>0<\/td>/);
+
+    // Future (24213.75) displays as 24213
+    expect(html).toMatch(/<td[^>]*title="24213\.75"[^>]*>24213<\/td>/);
+  });
+
+  it("Hover tooltip (title attribute) contains the exact original decimal value", () => {
+    expect(html).toMatch(/title="1\.85"/);
+    expect(html).toMatch(/title="1\.95"/);
+    expect(html).toMatch(/title="1\.2"/);
+    expect(html).toMatch(/title="1\.45"/);
+    expect(html).toMatch(/title="79\.4"/);
+    expect(html).toMatch(/title="515\.25"/);
+    expect(html).toMatch(/title="1\.61"/);
+    expect(html).toMatch(/title="1\.58"/);
+    expect(html).toMatch(/title="168\.66"/);
+    expect(html).toMatch(/title="24213\.75"/);
+  });
+
+  it("Call/Put Sign columns do not produce -0 in display or tooltip", () => {
+    expect(html).not.toMatch(/>-0</);
+    expect(html).not.toMatch(/title="-0"/);
+  });
+});

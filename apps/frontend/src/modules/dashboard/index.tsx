@@ -609,6 +609,10 @@ export function Dashboard() {
       const exFmt    = formatExpiryForBroker(expDate);
       const ceSymbol = (exFmt && t !== "Put"  && cs) ? `${inst}${exFmt}C${cs}` : null;
       const peSymbol = (exFmt && t !== "Call" && ps) ? `${inst}${exFmt}P${ps}`  : null;
+      const ceUpdatedAt = ceSymbol ? prices[ceSymbol]?.lastUpdated?.getTime() : undefined;
+      const ceFresh     = ceUpdatedAt !== undefined && (now - ceUpdatedAt) < FRESH_TTL_MS;
+      const peUpdatedAt = peSymbol ? prices[peSymbol]?.lastUpdated?.getTime() : undefined;
+      const peFresh     = peUpdatedAt !== undefined && (now - peUpdatedAt) < FRESH_TTL_MS;
       const ceLtp = ceSymbol ? (prices[ceSymbol]?.ltp ?? null) : null;
       const peLtp = peSymbol ? (prices[peSymbol]?.ltp ?? null) : null;
 
@@ -662,8 +666,8 @@ export function Dashboard() {
         }
 
         const sLtp = spotLtp ?? futLtp;
-        const ceN  = ceLtp ?? NaN;
-        const peN  = peLtp ?? NaN;
+        const ceN  = ceFresh && ceLtp !== null ? ceLtp : NaN;
+        const peN  = peFresh && peLtp !== null ? peLtp : NaN;
         barRef.current = {
           callO: ceN, callH: ceN, callL: ceN, callC: ceN,
           putO:  peN, putH:  peN, putL:  peN, putC:  peN,
@@ -673,8 +677,8 @@ export function Dashboard() {
           windowStart,
         };
 
-        const callBar: OHLCBar = { t: windowStart, o: ceN, h: ceN, l: ceN, c: ceN };
-        const putBar:  OHLCBar = { t: windowStart, o: peN, h: peN, l: peN, c: peN };
+        const callBar: OHLCBar = (ceFresh && !isNaN(ceN)) ? { t: windowStart, o: ceN, h: ceN, l: ceN, c: ceN } : MISSING_BAR(windowStart);
+        const putBar:  OHLCBar = (peFresh && !isNaN(peN)) ? { t: windowStart, o: peN, h: peN, l: peN, c: peN } : MISSING_BAR(windowStart);
         const futBar:  OHLCBar = futFresh  ? { t: windowStart, o: futLtp, h: futLtp, l: futLtp, c: futLtp } : MISSING_BAR(windowStart);
         const spotBar: OHLCBar = spotFresh ? { t: windowStart, o: sLtp,   h: sLtp,   l: sLtp,   c: sLtp   } : MISSING_BAR(windowStart);
 
@@ -748,8 +752,8 @@ export function Dashboard() {
         b.spotL = Math.min(b.spotL, sLtp);
         b.spotC = sLtp;
 
-        const callBar: OHLCBar = { t: b.windowStart, o: b.callO, h: b.callH, l: b.callL, c: b.callC };
-        const putBar:  OHLCBar = { t: b.windowStart, o: b.putO,  h: b.putH,  l: b.putL,  c: b.putC  };
+        const callBar: OHLCBar = (ceFresh && !isNaN(b.callC)) ? { t: b.windowStart, o: b.callO, h: b.callH, l: b.callL, c: b.callC } : MISSING_BAR(b.windowStart);
+        const putBar:  OHLCBar = (peFresh && !isNaN(b.putC))  ? { t: b.windowStart, o: b.putO,  h: b.putH,  l: b.putL,  c: b.putC  } : MISSING_BAR(b.windowStart);
         const futBar:  OHLCBar = futFresh  ? { t: b.windowStart, o: b.futO,  h: b.futH,  l: b.futL,  c: b.futC  } : MISSING_BAR(b.windowStart);
         const spotBar: OHLCBar = spotFresh ? { t: b.windowStart, o: b.spotO, h: b.spotH, l: b.spotL, c: b.spotC } : MISSING_BAR(b.windowStart);
 

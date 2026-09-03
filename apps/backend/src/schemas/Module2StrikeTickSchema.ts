@@ -54,8 +54,17 @@ export const Module2StrikeTickSchema = new Schema({
   },
 });
 
+// Compound unique index to prevent duplicate minute records within the same tracking session
+Module2StrikeTickSchema.index(
+  { session_id: 1, strike: 1, minute_timestamp: 1 },
+  { unique: true }
+);
+
 // Compound Index to retrieve session ticks quickly ordered by time
 Module2StrikeTickSchema.index({ session_id: 1, strike: 1, minute_timestamp: -1 });
+
+// Historical query index across same-day sessions for a strike
+Module2StrikeTickSchema.index({ strike: 1, minute_timestamp: 1 });
 
 // TTL index to automatically purge old tracker records after 24 hours (86400 seconds)
 Module2StrikeTickSchema.index({ minute_timestamp: 1 }, { expireAfterSeconds: 86400 });

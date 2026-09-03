@@ -136,16 +136,25 @@ function getStaticCellStyle(colId: string, row: DashboardRow): CellColor {
   }
 }
 
-const p0 = (n: number | null | undefined): string =>
-  n == null || !Number.isFinite(n) ? "—" : truncateForDisplay(n).toLocaleString("en-IN");
+const p0 = (n: number | null | undefined): string => {
+  if (n == null || !Number.isFinite(n)) return "—";
+  const val = truncateForDisplay(n);
+  const clean = Object.is(val, -0) || val === 0 ? 0 : val;
+  return clean.toLocaleString("en-IN");
+};
 
-const p0NoGroup = (n: number | null | undefined): string =>
-  n == null || !Number.isFinite(n) ? "—" : String(truncateForDisplay(n));
+const p0NoGroup = (n: number | null | undefined): string => {
+  if (n == null || !Number.isFinite(n)) return "—";
+  const val = truncateForDisplay(n);
+  const clean = Object.is(val, -0) || val === 0 ? 0 : val;
+  return String(clean);
+};
 
-const fmtSign = (n: number): string => {
-  if (!Number.isFinite(n)) return "—";
-  const tr = truncateForDisplay(n);
-  return tr.toLocaleString("en-IN");
+const fmtSign = (n: number | null | undefined): string => {
+  if (n == null || !Number.isFinite(n)) return "—";
+  const val = truncateForDisplay(n);
+  const clean = Object.is(val, -0) || val === 0 ? 0 : val;
+  return clean.toLocaleString("en-IN");
 };
 
 const fmtVwap = (n: number | null | undefined): string =>
@@ -172,7 +181,7 @@ const fmtTime = (ms: number): string => {
 export function rankingDisplayValue(row: DashboardRow, prevRow: DashboardRow | undefined): string {
   const dir = rankingDir(row.ranking, prevRow?.ranking);
   let val = p0(row.ranking);
-  if (dir === "down" && row.ranking >= 0) {
+  if (dir === "down" && row.ranking >= 0 && !val.startsWith("-") && val !== "0") {
     val = "-" + val;
   }
   return val;
@@ -302,8 +311,19 @@ export function getCellRawValue(row: DashboardRow, colId: string, pivotMethod: P
   }
 }
 
+export function getCellTooltip(row: DashboardRow, colId: string, pivotMethod: PivotMethod = "client"): string | undefined {
+  const raw = getCellRawValue(row, colId, pivotMethod);
+  if (raw == null || typeof raw !== "number" || !Number.isFinite(raw)) {
+    return undefined;
+  }
+  const clean = Object.is(raw, -0) || raw === 0 ? 0 : raw;
+  const rounded = Number(Math.round(Number(clean + "e4")) + "e-4");
+  return String(rounded);
+}
+
 export interface DashboardCellPresentation {
   value: string;
+  tooltip?: string;
   bg: string;
   textColor: string;
   fontWeight: number;
@@ -323,6 +343,7 @@ export function getDashboardCellPresentation(params: {
     : getStaticCellStyle(colId, row);
 
   let value = getCellValue(row, colId, pivotMethod);
+  const tooltip = getCellTooltip(row, colId, pivotMethod);
   let bg = baseStyle.bg;
   let textColor = baseStyle.textColor;
   let fontWeight = NON_NUMERIC_COLS.has(colId) ? 400 : 600;
@@ -338,5 +359,5 @@ export function getDashboardCellPresentation(params: {
     value = rankingDisplayValue(row, prevRow);
   }
 
-  return { value, bg, textColor, fontWeight };
+  return { value, tooltip, bg, textColor, fontWeight };
 }

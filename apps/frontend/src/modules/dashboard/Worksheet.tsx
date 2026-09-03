@@ -544,6 +544,7 @@ export function Worksheet({ rows, hiddenCols, colOrder, feedStatus, isLoading, t
                     <td
                       key={c.id}
                       data-colored={isColored ? "true" : undefined}
+                      title={presentation.tooltip}
                       style={{
                         border: "1px solid #BDC4CF",
                         padding: "6px 10px",

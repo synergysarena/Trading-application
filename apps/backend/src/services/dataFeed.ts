@@ -88,7 +88,6 @@ let sessionExpired = false;
 // clobbering the newly started one.
 let connectionGeneration = 0;
 
-const MAX_RECONNECT_ATTEMPTS = 5;
 const RECONNECT_BASE_DELAY_MS = 4000;
 
 const clearReconnectTimer = () => {
@@ -115,18 +114,11 @@ const handleFeedDisconnect = (reason: string, gen: number) => {
     return;
   }
 
-  if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-    console.warn(`[DataFeed] Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Stopping.`);
-    broadcastBrokerStatus("broker-disconnected", "Max reconnection attempts exceeded", "module1");
-    storedUserId = null;
-    storedSessionToken = null;
-    return;
-  }
-
-  const delay = RECONNECT_BASE_DELAY_MS * Math.pow(2, reconnectAttempts);
+  // Resilient exponential backoff capped at 30 seconds for background recovery
+  const delay = Math.min(30000, Math.round(RECONNECT_BASE_DELAY_MS * Math.pow(1.5, Math.min(reconnectAttempts, 10))));
   reconnectAttempts++;
-  console.log(`[DataFeed] Reconnecting in ${delay}ms (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})…`);
-  broadcastBrokerStatus("reconnecting", `Attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}`, "module1");
+  console.log(`[DataFeed] Reconnecting in ${delay}ms (attempt #${reconnectAttempts}) — reason: ${reason}…`);
+  broadcastBrokerStatus("reconnecting", `Attempt #${reconnectAttempts}`, "module1");
 
   reconnectTimer = setTimeout(async () => {
     if (!storedUserId || !storedSessionToken) return;
@@ -186,7 +178,6 @@ export const startDataFeedWithCredentials = async (userId: string, sessionToken:
     storedUserId = userId;
     storedSessionToken = sessionToken;
     sessionExpired = false;
-    reconnectAttempts = 0;
     // Best-effort durable copy so a later resume (session-restore path) can
     // restart the feed even after this process-memory copy is gone.
     persistBrokerSession(userId, sessionToken);
@@ -235,6 +226,7 @@ export const startDataFeedWithCredentials = async (userId: string, sessionToken:
       },
       () => {
         isConnecting = false;
+        reconnectAttempts = 0;
         // Called when the Zebu WebSocket actually connects and the handshake is sent.
         // Only broadcast "live" at this point — not prematurely.
         console.log("[DataFeed] Zebu WS open — broadcasting live status");
@@ -247,19 +239,10 @@ export const startDataFeedWithCredentials = async (userId: string, sessionToken:
   }
 };
 
-import { getActiveModule1SessionCount } from "./module1SessionService";
-
 /**
- * Stop the live feed and clear all state (called on explicit user logout or server shutdown).
- * Hard safety guard: if active Module 1 sessions exist, shutdown is blocked unless forced (e.g. server termination).
+ * Stop the live feed and clear all state (called on explicit user global shutdown or server termination).
  */
-export const stopDataFeed = (force = false) => {
-  const activeCount = getActiveModule1SessionCount();
-  if (!force && activeCount > 0) {
-    console.warn(`[Module1/Broker] STOP_BLOCKED active=${activeCount}`);
-    return;
-  }
-
+export const stopDataFeed = (_force = false) => {
   // Invalidate any in-flight or pending disconnect callbacks
   connectionGeneration++;
   clearReconnectTimer();
@@ -273,8 +256,7 @@ export const stopDataFeed = (force = false) => {
   }
   setModule1OiDataSource("SIMULATOR");
   resetMarketReady();
-  // Explicit stop (logout) means the next login should be a real one — don't
-  // let a stale cached module1Token silently resume this session later.
+  // Explicit stop (e.g. global shutdown) means clear persisted broker session
   clearPersistedBrokerSession();
 };
 

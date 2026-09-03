@@ -77,7 +77,12 @@ export const stopSession = async (req: AuthenticatedRequest, res: Response) => {
       // Stop strictly this targeted session
       await stopTrackerSession(sessionId);
       delete activeSessions[sessionId];
-      Module2Session.findByIdAndDelete(sessionId).catch(() => {});
+      await Module2Session.findByIdAndUpdate(sessionId, {
+        status: "STOPPED",
+        stopped_at: new Date(),
+      }).catch((err) => {
+        console.warn("[MODULE2-TRACKER] Failed to mark session STOPPED in DB:", err?.message || err);
+      });
     } else {
       // Fallback: stop all sessions strictly belonging to this user
       const userActiveSessionIds = Object.keys(activeSessions).filter(
@@ -86,6 +91,12 @@ export const stopSession = async (req: AuthenticatedRequest, res: Response) => {
       for (const sId of userActiveSessionIds) {
         await stopTrackerSession(sId);
         delete activeSessions[sId];
+        await Module2Session.findByIdAndUpdate(sId, {
+          status: "STOPPED",
+          stopped_at: new Date(),
+        }).catch((err) => {
+          console.warn("[MODULE2-TRACKER] Failed to mark session STOPPED in DB:", err?.message || err);
+        });
       }
     }
 

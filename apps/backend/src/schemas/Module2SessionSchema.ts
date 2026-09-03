@@ -32,6 +32,24 @@ export const Module2SessionSchema = new Schema(
       type: Object,
       default: {},
     },
+    status: {
+      type: String,
+      enum: ["ACTIVE", "STOPPED"],
+      default: "ACTIVE",
+      index: true,
+    },
+    started_at: {
+      type: Date,
+      default: Date.now,
+    },
+    stopped_at: {
+      type: Date,
+      default: null,
+    },
+    strike_start_boundaries: {
+      type: Object, // Map of strike -> ISO timestamp / Date string
+      default: {},
+    },
   },
   {
     timestamps: { createdAt: "created_at", updatedAt: "updated_at" },

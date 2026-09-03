@@ -219,39 +219,35 @@ describe("High/Low/Close use light green/pink but dark blue/black (\"hlc\" theme
   });
 });
 
-// ── Display-truncation consistency ────────────────────────────────────────────
-// Regression coverage for a real client-reported defect: the color engine
-// used to compare raw, full-precision values while the cell displays
-// Math.trunc(value) — so two rows showing the identical on-screen number
-// (e.g. both "19") could still get colored if their raw values differed by a
-// fraction. The engine must compare the SAME truncated value the cell shows,
-// so "visually unchanged" and "no color" always agree.
-describe("buildLiveColorGrid — colors match the displayed (truncated) value, not the raw float", () => {
-  it("raw values that display as the same integer are treated as a tie -> green (equal-value rule), not a real decrease", () => {
-    // 19.6 -> 19.2: a real ~2% raw decrease, but both truncate to "19", so
-    // the color engine treats it as an equal-value tie (green), not a drop.
-    const rows = [19.6, 19.2].map(rowWithCallOpen);
+function rowWithFutureOpen(o: number): DashboardRow {
+  const row = rowWithCallOpen(1);
+  return { ...row, future: { ...row.future, o } };
+}
+
+describe("buildLiveColorGrid — colors evaluate based on ORIGINAL decimal values", () => {
+  it("option columns evaluate colors on exact original decimal values", () => {
+    // 1.85 -> 1.95 -> 1.20: 1.95 is a new high (blue), 1.20 is a new low (black)
+    const rows = [1.85, 1.95, 1.20].map(rowWithCallOpen);
     const grid = buildLiveColorGrid(rows);
-    expect(grid["ce-o"]).toEqual([null, "green"]);
+    expect(grid["ce-o"]).toEqual([null, "blue", "black"]);
   });
 
-  it("reproduces the client's reported dataset shape: 19.4, 19.2, 19.6, 19.1 (all display 19/19/19/19) -> tie-green on every row after the first", () => {
-    const rows = [19.4, 19.2, 19.6, 19.1].map(rowWithCallOpen);
+  it("future columns evaluate colors on exact original values (e.g. fractional decrease is black/pink)", () => {
+    // 24210.6 -> 24210.2 (new lowest -> black) -> 24210.4 (up -> green) -> 24210.3 (drop not lowest -> pink)
+    const rows = [24210.6, 24210.2, 24210.4, 24210.3].map(rowWithFutureOpen);
     const grid = buildLiveColorGrid(rows);
-    expect(grid["ce-o"]).toEqual([null, "green", "green", "green"]);
+    expect(grid["fut-o"]).toEqual([null, "black", "green", "pink"]);
   });
 
-  it("still colors when the DISPLAYED integer actually changes, even by a fraction that crosses the boundary", () => {
-    // 18.9 -> 19.1: displays as "18" then "19" — a real, visible change
-    const rows = [18.9, 19.1].map(rowWithCallOpen);
+  it("fractional increase to a new high receives blue", () => {
+    // 24210.9 -> 24211.1: new highest -> blue
+    const rows = [24210.9, 24211.1].map(rowWithFutureOpen);
     const grid = buildLiveColorGrid(rows);
-    expect(grid["ce-o"]).toEqual([null, "blue"]);
+    expect(grid["fut-o"]).toEqual([null, "blue"]);
   });
 
-  it("highest tracking uses the truncated value too, so a raw-only new high that doesn't cross the display boundary is not a new high (tie -> green, not blue)", () => {
-    // 20.9 (displays 20, becomes highest=20) -> 20.1 (still displays 20, tie
-    // with prevValue=20 and not > highestBefore=20) -> green, not blue
-    const rows = [20.9, 20.1].map(rowWithCallOpen);
+  it("identical decimal values resolve as tie -> green", () => {
+    const rows = [1.85, 1.85].map(rowWithCallOpen);
     const grid = buildLiveColorGrid(rows);
     expect(grid["ce-o"]).toEqual([null, "green"]);
   });

@@ -1,4 +1,4 @@
-import { stopDataFeed, resumeDataFeedFromPersistedSession } from "./dataFeed";
+import { resumeDataFeedFromPersistedSession } from "./dataFeed";
 import { isZebuLiveConnected } from "./zebuMarketDataClient";
 import crypto from "crypto";
 
@@ -18,56 +18,31 @@ const sessionsBySocket = new Map<string, Module1Session>();
 const socketIdsByUser = new Map<string, Set<string>>();
 
 // ── Broker Lifecycle State ──────────────────────────────────────────────────
-const GRACE_PERIOD_MS = 45000; // 45 seconds graceful shutdown delay
-let shutdownTimer: NodeJS.Timeout | null = null;
 let staleCheckInterval: NodeJS.Timeout | null = null;
-
-const cancelShutdownTimer = () => {
-  if (shutdownTimer) {
-    clearTimeout(shutdownTimer);
-    shutdownTimer = null;
-    console.log(`[Module1/Broker] SHUTDOWN_CANCELLED active=${sessionsBySocket.size}`);
-  }
-};
 
 /**
  * Reacts to transitions in the active Module 1 session count.
- * Completely decoupled from session tracking and tick processing.
+ * Client socket presence does NOT control the market-data feed lifecycle.
+ * The feed continues running in the background even when active socket count reaches 0.
  */
 const handleSessionCountTransition = (prevCount: number, currentCount: number) => {
-  if (currentCount > 0) {
-    cancelShutdownTimer();
-  }
-
-  if (prevCount === 0 && currentCount === 1) {
-    // If broker is not currently connected, attempt to resume from persisted session if one exists
+  if (prevCount === 0 && currentCount >= 1) {
+    // If broker is not currently connected when the first client connects, attempt to auto-resume
+    // from persisted broker session if one exists in Redis.
     if (!isZebuLiveConnected()) {
       resumeDataFeedFromPersistedSession().then((result) => {
-        console.log(`[Module1/Broker] Auto-resume result on first active session: ${result}`);
+        console.log(`[Module1/Broker] Auto-resume check on active client connection: ${result}`);
       }).catch((err) => {
-        console.warn("[Module1/Broker] Auto-resume failed on first active session:", err?.message || err);
+        console.warn("[Module1/Broker] Auto-resume check failed on client connection:", err?.message || err);
       });
     } else {
-      console.log(`[Module1/Broker] KEEP_ALIVE active=${currentCount}`);
+      console.log(`[Module1/Broker] Client connected to live feed (active sockets: ${currentCount})`);
     }
   } else if (currentCount > 0) {
-    console.log(`[Module1/Broker] KEEP_ALIVE active=${currentCount}`);
+    console.log(`[Module1/Broker] Active client sockets: ${currentCount}`);
   } else if (currentCount === 0) {
-    console.log(`[Module1/Broker] SHUTDOWN_SCHEDULED active=0 delay=${GRACE_PERIOD_MS}ms`);
-    if (shutdownTimer) {
-      clearTimeout(shutdownTimer);
-      shutdownTimer = null;
-    }
-    shutdownTimer = setTimeout(() => {
-      shutdownTimer = null;
-      console.log(`[Module1/Broker] STOP_CHECK active=${sessionsBySocket.size}`);
-      if (sessionsBySocket.size === 0) {
-        console.log("[Module1/Broker] STOP_EXECUTING active=0");
-        stopDataFeed();
-      } else {
-        console.log(`[Module1/Broker] STOP_BLOCKED active=${sessionsBySocket.size}`);
-      }
-    }, GRACE_PERIOD_MS);
+    // All client tabs closed/disconnected: feed continues running independently in background
+    console.log("[Module1/Broker] Zero active client sockets. Live feed and storage continue running in background.");
   }
 };
 
@@ -238,10 +213,6 @@ initStaleSessionSweeper();
  * Clears all active module 1 sessions during global shutdown.
  */
 export const clearAllModule1Sessions = () => {
-  if (shutdownTimer) {
-    clearTimeout(shutdownTimer);
-    shutdownTimer = null;
-  }
   const clearedCount = sessionsBySocket.size;
   sessionsBySocket.clear();
   socketIdsByUser.clear();
@@ -252,10 +223,6 @@ export const clearAllModule1Sessions = () => {
  * Cleanup function for server shutdown.
  */
 export const stopSessionManager = () => {
-  if (shutdownTimer) {
-    clearTimeout(shutdownTimer);
-    shutdownTimer = null;
-  }
   if (staleCheckInterval) {
     clearInterval(staleCheckInterval);
     staleCheckInterval = null;

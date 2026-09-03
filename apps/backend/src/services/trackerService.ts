@@ -91,18 +91,24 @@ export const syncAetramSubscriptions = async () => {
 
 export const stopTrackerSession = async (sessionId: string) => {
   console.log(`[MODULE2-TRACKER] STOPPING session=${sessionId}`);
-  let found = false;
 
   if (activeSessions[sessionId]) {
     delete activeSessions[sessionId];
-    found = true;
   }
 
   for (const [sId, sess] of Object.entries(activeSessions)) {
     if (sId === sessionId || sess.sessionId === sessionId) {
       delete activeSessions[sId];
-      found = true;
     }
+  }
+
+  try {
+    await Module2Session.findByIdAndUpdate(sessionId, {
+      status: "STOPPED",
+      stopped_at: new Date(),
+    });
+  } catch (err: any) {
+    console.warn("[MODULE2-TRACKER] Failed to mark session STOPPED in DB:", err?.message || err);
   }
 
   const remainingCount = Object.keys(activeSessions).length;
@@ -420,8 +426,11 @@ const executeMinuteBoundary = async () => {
             oi_buy: oiBuy,
             oi_sell: oiSell
           });
-        } catch (err) {
-          // Suppress warning to avoid console spamming when DB is offline
+        } catch (err: any) {
+          // Suppress duplicate key or DB connection warnings
+          if (err?.code !== 11000) {
+            // non-duplicate error
+          }
         }
 
         // Broadcast to connected clients
@@ -454,7 +463,7 @@ const executeMinuteBoundary = async () => {
 
 
 /**
- * Starts a new Module 2 tracking session
+ * Starts a new Module 2 tracking session with persistent historical strike stitching
  */
 export const startTrackerSession = async (
   userId: string,
@@ -465,53 +474,203 @@ export const startTrackerSession = async (
 ): Promise<Module2SessionData> => {
   console.log(`[MODULE2-TRACKER] START REQUEST userId=${userId} index=${indexSymbol} expiry=${expiryDate} strikes=${selectedStrikes.length}`);
 
-  // Capture Day Open prices and OI for each selected strike from Redis
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  // Find previous sessions from today for this user, symbol, and expiry to restore historical strike data
+  let previousSessionIds: any[] = [];
+  const existingStrikeStartBoundaries: Record<string, string> = {};
+  try {
+    const previousDocs = await Module2Session.find({
+      user_id: userId,
+      index_symbol: indexSymbol,
+      expiry_date: expiryDate,
+      created_at: { $gte: today },
+    }).select("_id strike_start_boundaries day_open_prices_json created_at").lean();
+
+    previousSessionIds = previousDocs.map((d: any) => d._id);
+    for (const pDoc of previousDocs) {
+      if (pDoc.strike_start_boundaries) {
+        for (const [s, b] of Object.entries(pDoc.strike_start_boundaries as Record<string, any>)) {
+          if (!existingStrikeStartBoundaries[s] && b) {
+            existingStrikeStartBoundaries[s] = typeof b === "string" ? b : new Date(b).toISOString();
+          }
+        }
+      }
+    }
+  } catch (err: any) {
+    console.warn("[MODULE2-TRACKER] Could not query previous sessions for history:", err?.message || err);
+  }
+
   const dayOpenPrices: Record<string, number> = {};
   const strikes: Record<string, Module2StrikeState> = {};
+  const strikeStartBoundaries: Record<string, string> = {};
   const norm = normalizeCandleTimestamp(Date.now());
   const initialMinutes = norm.minuteIndex;
   const initialTimeString = norm.timeString;
+  const currentIsoString = new Date(norm.timestampMs).toISOString();
 
   for (const strike of selectedStrikes) {
     const rawPrice = await readLive(`ltp:${strike}`);
-    const ltp = rawPrice ? parseFloat(rawPrice) : 0;
+    const liveLtp = rawPrice ? parseFloat(rawPrice) : 0;
 
     const rawOi = await readLive(`oi:${strike}`);
-    const oi = rawOi ? Math.floor(parseFloat(rawOi)) : 0;
+    const liveOi = rawOi ? Math.floor(parseFloat(rawOi)) : 0;
 
-    dayOpenPrices[strike] = ltp;
+    // 1. Query previously persisted Module2StrikeTick records for this strike from today's sessions
+    let pastTicks: any[] = [];
+    if (previousSessionIds.length > 0) {
+      try {
+        pastTicks = await Module2StrikeTick.find({
+          session_id: { $in: previousSessionIds },
+          strike,
+          minute_timestamp: { $gte: today },
+        }).sort({ minute_timestamp: 1 }).lean();
+      } catch (dbErr) {
+        console.warn(`[MODULE2-TRACKER] Failed to fetch past ticks for strike ${strike}:`, dbErr);
+      }
+    }
 
-    const initialCell: Module2Cell = {
-      ltp,
-      minute: initialMinutes,
-      timestamp: initialTimeString,
-      isHigh: ltp > 0,
-      isLow: ltp > 0,
-      oi,
-      oiDelta: 0,
-      oiBuy: oi,
-      oiSell: 0
-    };
+    // 2. Deduplicate past ticks by minute timestamp
+    const seenMinutes = new Set<string>();
+    const dedupedTicks: any[] = [];
+    for (const t of pastTicks) {
+      const cellNorm = normalizeCandleTimestamp(t.minute_timestamp);
+      if (!seenMinutes.has(cellNorm.timeString)) {
+        seenMinutes.add(cellNorm.timeString);
+        dedupedTicks.push({ ...t, cellNorm });
+      }
+    }
 
-    strikes[strike] = {
-      strike,
-      dayOpen: ltp,
-      dayHigh: ltp,
-      dayLow: ltp,
-      grid: [initialCell],
-      trendBadge: "FLAT",
-      isDowntrendActive: false,
-      isDeepLoss: false,
-      pctChange: 0,
-      oiLatest: oi,
-      oiBuyLatest: 0,
-      oiSellLatest: 0,
-      oiHigh: oi,
-      oiLow: oi,
-      oiMean: oi,
-      _oiRunningSum: oi,
-      _oiRowCount: 1
-    } as any;
+    if (dedupedTicks.length > 0) {
+      // Historical data exists from an earlier tracking session today
+      const historicalGrid: Module2Cell[] = dedupedTicks.map((t: any) => ({
+        ltp: t.ltp_integer,
+        minute: t.cellNorm.minuteIndex,
+        timestamp: t.cellNorm.timeString,
+        isHigh: t.is_day_high,
+        isLow: t.is_day_low,
+        oi: t.oi || 0,
+        oiDelta: t.oi_delta || 0,
+        oiBuy: t.oi_buy || 0,
+        oiSell: t.oi_sell || 0,
+      }));
+
+      const firstValidTick = dedupedTicks.find((t: any) => t.ltp_integer > 0);
+      const dayOpen = firstValidTick ? firstValidTick.ltp_integer : (liveLtp || 0);
+      dayOpenPrices[strike] = dayOpen;
+
+      const dayHigh = Math.max(dayOpen, ...dedupedTicks.map((t: any) => t.ltp_integer || 0), liveLtp || 0);
+      const positiveLows = [dayOpen, ...dedupedTicks.map((t: any) => t.ltp_integer || 0), liveLtp || 0].filter((p) => p > 0);
+      const dayLow = positiveLows.length > 0 ? Math.min(...positiveLows) : dayOpen;
+
+      const oiLatest = liveOi || (dedupedTicks.length > 0 ? dedupedTicks[dedupedTicks.length - 1].oi : 0);
+      const oiHigh = Math.max(...dedupedTicks.map((t: any) => t.oi || 0), liveOi);
+      const positiveOis = [...dedupedTicks.map((t: any) => t.oi || 0), liveOi].filter((o) => o > 0);
+      const oiLow = positiveOis.length > 0 ? Math.min(...positiveOis) : oiLatest;
+      const oiRunningSum = dedupedTicks.reduce((sum: number, t: any) => sum + (t.oi || 0), 0);
+      const oiRowCount = dedupedTicks.length;
+      const oiMean = oiRowCount > 0 ? Math.round(oiRunningSum / oiRowCount) : oiLatest;
+
+      let trendBadge: TrendBadgeState = "FLAT";
+      if (historicalGrid.length >= 5) {
+        const recent = historicalGrid.slice(-5).map((c) => c.ltp);
+        let up = 0;
+        let down = 0;
+        for (let i = 1; i < recent.length; i++) {
+          if (recent[i] > recent[i - 1]) up++;
+          if (recent[i] < recent[i - 1]) down++;
+        }
+        if (down >= 4) trendBadge = "H_TO_L";
+        else if (up >= 4) trendBadge = "L_TO_H";
+      }
+
+      const lastTickDoc = dedupedTicks[dedupedTicks.length - 1];
+      const isDowntrendActive = lastTickDoc?.is_downtrend_flagged || false;
+      const currentLtpForCheck = liveLtp || (historicalGrid.length > 0 ? historicalGrid[historicalGrid.length - 1].ltp : dayOpen);
+      const isDeepLoss = currentLtpForCheck > 0 && dayOpen > 0 ? currentLtpForCheck < dayOpen * 0.85 : false;
+      const pctChange = dayOpen > 0 ? Number((((currentLtpForCheck - dayOpen) / dayOpen) * 100).toFixed(2)) : 0;
+
+      // Append current minute cell if not already in historical grid
+      const existingCurrentCell = historicalGrid.find((c) => c.timestamp === initialTimeString || c.minute === initialMinutes);
+      if (!existingCurrentCell) {
+        const lastHistOi = (historicalGrid.length > 0 ? historicalGrid[historicalGrid.length - 1].oi : 0) || 0;
+        const oiDelta = lastHistOi > 0 && liveOi > 0 ? liveOi - lastHistOi : 0;
+        const oiBuy = oiDelta > 0 ? oiDelta : 0;
+        const oiSell = oiDelta < 0 ? Math.abs(oiDelta) : 0;
+        historicalGrid.push({
+          ltp: liveLtp,
+          minute: initialMinutes,
+          timestamp: initialTimeString,
+          isHigh: liveLtp > 0 && liveLtp === dayHigh,
+          isLow: liveLtp > 0 && liveLtp === dayLow,
+          oi: liveOi,
+          oiDelta,
+          oiBuy,
+          oiSell,
+        });
+      }
+
+      const firstTickTimestamp = dedupedTicks[0].minute_timestamp;
+      strikeStartBoundaries[strike] = existingStrikeStartBoundaries[strike] || (firstTickTimestamp instanceof Date ? firstTickTimestamp.toISOString() : new Date(firstTickTimestamp).toISOString());
+
+      strikes[strike] = {
+        strike,
+        dayOpen,
+        dayHigh,
+        dayLow,
+        grid: historicalGrid,
+        trendBadge,
+        isDowntrendActive,
+        isDeepLoss,
+        pctChange,
+        oiLatest,
+        oiBuyLatest: historicalGrid.length > 0 ? historicalGrid[historicalGrid.length - 1].oiBuy : 0,
+        oiSellLatest: historicalGrid.length > 0 ? historicalGrid[historicalGrid.length - 1].oiSell : 0,
+        oiHigh,
+        oiLow,
+        oiMean,
+        _oiRunningSum: oiRunningSum + (liveOi > 0 ? liveOi : 0),
+        _oiRowCount: oiRowCount + 1,
+      } as any;
+    } else {
+      // 3. New strike starting for the first time
+      dayOpenPrices[strike] = liveLtp;
+
+      const initialCell: Module2Cell = {
+        ltp: liveLtp,
+        minute: initialMinutes,
+        timestamp: initialTimeString,
+        isHigh: liveLtp > 0,
+        isLow: liveLtp > 0,
+        oi: liveOi,
+        oiDelta: 0,
+        oiBuy: liveOi,
+        oiSell: 0,
+      };
+
+      strikeStartBoundaries[strike] = currentIsoString;
+
+      strikes[strike] = {
+        strike,
+        dayOpen: liveLtp,
+        dayHigh: liveLtp,
+        dayLow: liveLtp,
+        grid: [initialCell],
+        trendBadge: "FLAT",
+        isDowntrendActive: false,
+        isDeepLoss: false,
+        pctChange: 0,
+        oiLatest: liveOi,
+        oiBuyLatest: 0,
+        oiSellLatest: 0,
+        oiHigh: liveOi,
+        oiLow: liveOi,
+        oiMean: liveOi,
+        _oiRunningSum: liveOi,
+        _oiRowCount: 1,
+      } as any;
+    }
   }
 
   // Resolve Futures symbols and fetch details
@@ -542,7 +701,11 @@ export const startTrackerSession = async (
       expiry_date: expiryDate,
       selected_strikes_json: selectedStrikes,
       day_open_prices_json: dayOpenPrices,
-      futures_oi_json: futuresOI
+      futures_oi_json: futuresOI,
+      status: "ACTIVE",
+      started_at: new Date(),
+      stopped_at: null,
+      strike_start_boundaries: strikeStartBoundaries,
     });
     sessionId = doc._id.toString();
     createdAt = doc.created_at;
@@ -562,6 +725,10 @@ export const startTrackerSession = async (
     selectedStrikes,
     dayOpenPrices,
     strikes,
+    status: "ACTIVE",
+    startedAt: createdAt,
+    stoppedAt: null,
+    strikeStartBoundaries,
     createdAt,
     futuresOI
   };
