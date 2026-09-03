@@ -122,9 +122,11 @@ export const getMarketDataAuthHealth = (): MarketDataAuthHealth => {
   };
 };
 
-/** Called on 401s from any Market Data request so all consumers see the same state. */
+/** Called on 401s, auth 400s, or explicit invalidation so all consumers see the same state. */
 export const markMarketDataSessionExpired = (): void => {
   if (session) {
+    const masked = session.token.length > 8 ? `${session.token.substring(0, 4)}...${session.token.slice(-4)}` : "***";
+    console.warn(`[AETRAM][AUTH] token invalidation — session marked expired for userID=${session.userID} (token=${masked})`);
     console.warn("[Module2Auth] Session expired.");
   }
   session = null;
@@ -137,13 +139,19 @@ export const markMarketDataSessionExpired = (): void => {
  * Authenticate against the Symphony XTS Market Data API.
  * Credentials may be provided at runtime (user login) or omitted to fall back
  * to the configured MOD2_API_KEY / MOD2_API_SECRET.
+ * If force is true, bypasses in-memory session reuse and forces fresh upstream authentication.
  */
 export const loginMarketData = async (
   appKey?: string,
-  secretKey?: string
+  secretKey?: string,
+  force?: boolean
 ): Promise<MarketDataLoginResult> => {
-  // If backend already has a live, unexpired Aetram session, reuse it without invalidating the active WebSocket
-  if (isMarketDataAuthenticated() && session) {
+  const isExplicitForce = force === true;
+
+  // If backend already has a live, unexpired Aetram session and this is NOT a forced refresh
+  if (!isExplicitForce && isMarketDataAuthenticated() && session) {
+    const masked = session.token.length > 8 ? `${session.token.substring(0, 4)}...${session.token.slice(-4)}` : "***";
+    console.log(`[AETRAM][AUTH] cached session reuse for userID=${session.userID} (token=${masked})`);
     console.log("[Module2Auth] Active Aetram session already established. Reusing existing session.");
     return {
       ok: true,
@@ -151,6 +159,11 @@ export const loginMarketData = async (
       userID: session.userID,
       expiresAt: session.expiresAt.toISOString(),
     };
+  }
+
+  // Clear stale in-memory session if forcing a fresh login
+  if (isExplicitForce) {
+    session = null;
   }
 
   const authUrl = getAuthUrl();
@@ -173,10 +186,10 @@ export const loginMarketData = async (
     };
   }
 
-    const maskedSecret = secret.length > 6 
+  const maskedSecret = secret.length > 6
     ? `${secret.slice(0, 3)}***${secret.slice(-3)}`
     : "***";
-  
+
   const reqBody = { secretKey: secret, appKey: key, source: "WEBAPI" };
   const reqHeaders = { "Content-Type": "application/json" };
 
@@ -223,7 +236,7 @@ Timestamp: ${new Date().toISOString()}
     console.log(`[AETRAM][NETWORK] Duration: ${duration}ms`);
 
     const body = response.data;
-    
+
     if (body?.type === "success" && body?.result?.token) {
       const now = new Date();
       session = {
@@ -233,13 +246,14 @@ Timestamp: ${new Date().toISOString()}
         expiresAt: new Date(now.getTime() + getSessionTtlMs()),
       };
       sessionEnded = null;
-      
-      const maskedToken = session.token.length > 12 
+
+      const maskedToken = session.token.length > 12
         ? `${session.token.substring(0, 8)}...[REDACTED]`
         : "***";
-      
+
       console.log("[AETRAM][AUTH] Login successful");
-      console.log(`[AETRAM][AUTH] Token received for userID: ${session.userID}`);
+      console.log(`[AETRAM][AUTH] fresh authentication for userID=${session.userID} token=${maskedToken}`);
+      console.log(`[AETRAM][AUTH] token refreshed for userID: ${session.userID}`);
       console.log(`----------------------------------------------------
 [Module2/Login] Authentication Success
 
@@ -283,7 +297,7 @@ Axios Message: undefined
 Axios Config: undefined
 Axios URL: undefined
 ----------------------------------------------------`);
-    
+
     return {
       ok: false,
       status: "NOT_AUTHENTICATED",
@@ -303,7 +317,7 @@ Axios URL: undefined
 
     const httpStatus: number | undefined = error?.response?.status;
     const body = error?.response?.data;
-    
+
     console.error(`----------------------------------------------------
 [Module2/Login] Authentication Failed
 
@@ -333,10 +347,10 @@ Axios URL: ${error?.config?.url}
     else if (error?.code === "ECONNABORTED") reason = "Market Data API request timed out.";
     else if (httpStatus) reason = body ? JSON.stringify(body) : `Market Data API rejected the request (HTTP ${httpStatus}).`;
 
-    return { 
-      ok: false, 
-      status: "NOT_AUTHENTICATED", 
-      error: reason, 
+    return {
+      ok: false,
+      status: "NOT_AUTHENTICATED",
+      error: reason,
       httpStatus,
       rawResponse: body
     } as any;

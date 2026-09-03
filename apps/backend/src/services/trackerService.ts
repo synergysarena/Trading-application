@@ -35,7 +35,7 @@ const getFuturesSymbol = (index: string): string => {
 /**
  * Synchronizes active option strike subscriptions with AETRAM MarketData API
  */
-export const syncAetramSubscriptions = async () => {
+export const syncAetramSubscriptions = async (forceResubscribe = false): Promise<boolean> => {
   const desiredMap = new Map<string, { segment: number; token: string }>();
 
   for (const session of Object.values(activeSessions)) {
@@ -59,7 +59,7 @@ export const syncAetramSubscriptions = async () => {
     }
   }
 
-  const currentlySubscribed = getActiveSubscribedInstruments();
+  const currentlySubscribed = forceResubscribe ? [] : getActiveSubscribedInstruments();
   const currentlySubscribedSet = new Set(currentlySubscribed.map((i: { segment: number; token: string }) => `${i.segment}|${i.token}`));
   const desiredKeys = new Set(desiredMap.keys());
 
@@ -71,21 +71,29 @@ export const syncAetramSubscriptions = async () => {
   }
 
   const toUnsubscribe: Array<{ segment: number; token: string }> = [];
-  for (const inst of currentlySubscribed) {
-    const key = `${inst.segment}|${inst.token}`;
-    if (!desiredKeys.has(key)) {
-      toUnsubscribe.push(inst);
+  if (!forceResubscribe) {
+    for (const inst of currentlySubscribed) {
+      const key = `${inst.segment}|${inst.token}`;
+      if (!desiredKeys.has(key)) {
+        toUnsubscribe.push(inst);
+      }
     }
   }
 
-  console.log(`[MODULE2-SUBSCRIPTION] activeSessions=${Object.keys(activeSessions).length} totalDesired=${desiredMap.size} toSubscribe=${toSubscribe.length} toUnsubscribe=${toUnsubscribe.length}`);
+  console.log(`[MODULE2-SUBSCRIPTION] activeSessions=${Object.keys(activeSessions).length} totalDesired=${desiredMap.size} currentSubscribed=${currentlySubscribed.length} toSubscribe=${toSubscribe.length} toUnsubscribe=${toUnsubscribe.length} forceResubscribe=${forceResubscribe}`);
 
-  if (toUnsubscribe.length > 0) {
-    await unsubscribeFromInstruments(toUnsubscribe);
-  }
+  try {
+    if (toUnsubscribe.length > 0) {
+      await unsubscribeFromInstruments(toUnsubscribe);
+    }
 
-  if (toSubscribe.length > 0) {
-    await subscribeToInstruments(toSubscribe);
+    if (toSubscribe.length > 0) {
+      await subscribeToInstruments(toSubscribe);
+    }
+    return true;
+  } catch (err: any) {
+    console.error(`[MODULE2-SUBSCRIPTION][ERROR] Subscription synchronization failed:`, err?.message || err);
+    return false;
   }
 };
 
@@ -128,7 +136,9 @@ export const initTrackerEngine = async () => {
   console.log("[MODULE2-TRACKER] Initialized. 0 active tracker sessions running (waiting for user Start).");
 
   // Register reconnect callback so subscriptions for active sessions (if any) are restored on WebSocket reconnect
-  setOnAetramReconnect(() => syncAetramSubscriptions());
+  setOnAetramReconnect(async () => {
+    await syncAetramSubscriptions(true);
+  });
 
   // Schedule the minute boundary checker
   scheduleNextMinuteBoundary();
@@ -739,12 +749,10 @@ export const startTrackerSession = async (
   const totalActive = Object.keys(activeSessions).length;
   console.log(`[MODULE2-TRACKER] START SUCCESS userId=${userId} session=${sessionId} activeUsers=${totalActive} minuteTimer=RUNNING`);
 
-  // Trigger Aetram subscription synchronization (unions all strikes across all active sessions)
-  try {
-    await syncAetramSubscriptions();
-  } catch (err) {
+  // Trigger Aetram subscription synchronization asynchronously so the start HTTP request returns immediately without timing out
+  syncAetramSubscriptions().catch((err) => {
     console.error("[MODULE2-SUBSCRIPTION] Subscription sync failed on session start:", err);
-  }
+  });
 
   return sessionData;
 };
@@ -1078,3 +1086,4 @@ export const onLiveTickReceived = (symbol: string, ltp: number) => {
     }
   }
 };
+  

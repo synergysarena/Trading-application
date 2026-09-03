@@ -1,3 +1,4 @@
+// @ts-ignore
 import io from "socket.io-client-v2";
 import { getMarketDataToken, getMarketDataUser, isMarketDataAuthenticated } from "./marketDataSessionService";
 import { marketDataEvents } from "./marketDataEvents";
@@ -216,12 +217,12 @@ const attemptConnect = async (): Promise<boolean> => {
 
   const attemptLabel = reconnectAttempts > 0 ? `reconnect attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}` : "initial attempt";
   const maskedToken = token.length > 8 ? `${token.substring(0, 4)}...${token.substring(token.length - 4)}` : "***";
-  
+
   let socketPath = "/apimarketdata/socket.io";
   try {
     const parsedPath = new URL(getBaseUrl()).pathname.replace(/\/$/, "");
     if (parsedPath) socketPath = `${parsedPath}/socket.io`;
-  } catch {}
+  } catch { }
 
   const fullUrl = `${host}${socketPath}?token=${maskedToken}&userID=${userID}&apiType=MARKETDATA&publishFormat=JSON`;
 

@@ -4,6 +4,7 @@ import { broadcastBrokerStatus } from "./socketService";
 import {
   loginMarketData,
   getMarketDataToken,
+  getMarketDataUser,
   isMarketDataAuthenticated,
   markMarketDataSessionExpired,
 } from "./marketDataSessionService";
@@ -24,8 +25,20 @@ export const setOnAetramReconnect = (fn: () => Promise<void>) => {
   _onReconnectFn = fn;
 };
 
+export const clearSearchCache = () => {
+  searchCache.clear();
+  symbolToTokenMap.clear();
+  tokenToSymbolMap.clear();
+};
+
+export const clearActiveSubscribedMap = () => {
+  activeSubscribedMap.clear();
+};
+
 export const clearAetramSession = () => {
   markMarketDataSessionExpired();
+  clearSearchCache();
+  clearActiveSubscribedMap();
   // The session backing the shared socket is gone — tear the connection down
   // too rather than leaving a socket open with a now-invalid token.
   disconnectMarketDataWebSocket();
@@ -60,19 +73,44 @@ const getApiSecret = () => (process.env.MOD2_API_SECRET || "").trim();
 const getBaseUrl = () => (process.env.AETRAM_MARKETDATA_API_BASE_URL || "").trim();
 const getAuthUrl = () => (process.env.AETRAM_MARKETDATA_AUTH_URL || "").trim();
 
+const MONTH_NAMES: Record<string, string> = {
+  JAN: "01", FEB: "02", MAR: "03", APR: "04", MAY: "05", JUN: "06",
+  JUL: "07", AUG: "08", SEP: "09", OCT: "10", NOV: "11", DEC: "12",
+};
+
 export const parseDateToYMD = (val: string | Date | number): string => {
   if (!val) return "";
   if (typeof val === "string") {
-    const isoMatch = val.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    const s = val.trim();
+    // 1. ISO: YYYY-MM-DD
+    const isoMatch = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
     if (isoMatch) {
       return `${isoMatch[1]}-${isoMatch[2]}-${isoMatch[3]}`;
+    }
+    // 2. DD-Mon-YYYY (e.g. 03-Sep-2026 or 03-SEP-2026)
+    const dmMatch = s.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})/);
+    if (dmMatch) {
+      const monthNum = MONTH_NAMES[dmMatch[2].toUpperCase()];
+      if (monthNum) {
+        return `${dmMatch[3]}-${monthNum}-${dmMatch[1].padStart(2, "0")}`;
+      }
+    }
+    // 3. DD/MM/YYYY
+    const slashMatch = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+    if (slashMatch) {
+      return `${slashMatch[3]}-${slashMatch[2].padStart(2, "0")}-${slashMatch[1].padStart(2, "0")}`;
+    }
+    // 4. DD-MM-YYYY
+    const dashMatch = s.match(/^(\d{1,2})-(\d{1,2})\-(\d{4})/);
+    if (dashMatch) {
+      return `${dashMatch[3]}-${dashMatch[2].padStart(2, "0")}-${dashMatch[1].padStart(2, "0")}`;
     }
   }
   const d = new Date(val);
   if (isNaN(d.getTime())) return "";
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
   return `${y}-${m}-${day}`;
 };
 
@@ -91,7 +129,7 @@ const getHeaders = () => {
 /**
  * Perform login to Aetram MarketData API using configured env credentials
  */
-export const loginToAetram = async (): Promise<boolean> => {
+export const loginToAetram = async (force?: boolean): Promise<boolean> => {
   const apiKey = getApiKey();
   const apiSecret = getApiSecret();
 
@@ -100,7 +138,7 @@ export const loginToAetram = async (): Promise<boolean> => {
     return false;
   }
 
-  const result = await loginMarketData();
+  const result = await loginMarketData(undefined, undefined, force);
   return result.ok;
 };
 
@@ -143,23 +181,45 @@ export const searchInstruments = async (searchString: string): Promise<AetramIns
   }
 
   const baseUrl = getBaseUrl();
-  if (!baseUrl) return [];
+  if (!baseUrl) {
+    console.warn("[AetramMD] Missing AETRAM_MARKETDATA_API_BASE_URL. Cannot search instruments.");
+    return [];
+  }
 
   // Ensure authenticated session
   if (!getMarketDataToken()) {
     await loginToAetram();
   }
 
-  if (!getMarketDataToken()) return [];
+  const token = getMarketDataToken();
+  if (!token) {
+    console.warn(`[AetramMD] Unauthenticated search aborted for query "${searchString}".`);
+    return [];
+  }
+
+  const maskedToken = token.length > 8 ? `${token.slice(0, 4)}...${token.slice(-4)}` : "***";
+  const searchUrl = `${baseUrl}/search/instruments?searchString=${encodeURIComponent(searchString)}`;
+
+  console.log(`[AETRAM][SESSION] session available=${isMarketDataAuthenticated()}`);
+  console.log(`[AETRAM][INSTRUMENT-SEARCH][REQUEST]
+searchString=${searchString}
+endpoint=${searchUrl}
+user=${getMarketDataUser() || "UNKNOWN"}
+tokenSource=BACKEND_SESSION
+token=${maskedToken}`);
 
   const searchPromise = (async () => {
+    const startTime = Date.now();
     try {
-      const searchUrl = `${baseUrl}/search/instruments?searchString=${encodeURIComponent(searchString)}`;
       const response = await axios.get(searchUrl, { headers: getHeaders(), timeout: 10000 });
+      const elapsed = Date.now() - startTime;
 
-      if (response.data?.type !== "success" || !Array.isArray(response.data.result)) return [];
+      if (response.data?.type !== "success" || !Array.isArray(response.data.result)) {
+        console.warn(`[AetramMD] Search returned non-success response shape: type=${response.data?.type || "unknown"}`);
+        return [];
+      }
 
-      const parsedResults = response.data.result.map((inst: any) => ({
+      const parsedResults: AetramInstrumentResult[] = response.data.result.map((inst: any) => ({
         exchangeSegment: Number(inst.ExchangeSegment ?? inst.exchangeSegment ?? 2),
         exchangeInstrumentID: String(inst.ExchangeInstrumentID ?? inst.exchangeInstrumentID ?? ""),
         name: String(inst.Name ?? inst.name ?? inst.symbol ?? ""),
@@ -173,15 +233,38 @@ export const searchInstruments = async (searchString: string): Promise<AetramIns
               : inst.strike !== undefined ? Number(inst.strike) : undefined,
         optionType: inst.OptionType || inst.optionType || inst.Type || inst.type || undefined,
       }));
+
       searchCache.set(cacheKey, { timestamp: Date.now(), data: parsedResults });
+      console.log(`[AETRAM][INSTRUMENT-SEARCH][SUCCESS] searchString=${searchString} status=${response.status} itemCount=${parsedResults.length} elapsed=${elapsed}ms`);
       return parsedResults;
     } catch (error: any) {
-      if (error?.response?.status === 401) {
-        console.warn("[AetramMD] Session expired (401) during instrument search.");
+      const elapsed = Date.now() - startTime;
+      const status = error?.response?.status || "N/A";
+      const respData = error?.response?.data;
+      const sanitizedResp = typeof respData === "object" ? JSON.stringify(respData) : (respData || error?.message || String(error));
+      const respLower = sanitizedResp.toLowerCase();
+
+      const isAuthFailure = status === 401 || (
+        status === 400 && (
+          respLower.includes("token") ||
+          respLower.includes("auth") ||
+          respLower.includes("session") ||
+          respLower.includes("unauthorized") ||
+          respLower.includes("invalid / expired")
+        )
+      );
+
+      console.error(`[AETRAM][INSTRUMENT-SEARCH][ERROR]
+searchString=${searchString}
+status=${status}
+response=${sanitizedResp}
+elapsed=${elapsed}ms
+authFailure=${isAuthFailure}`);
+
+      if (isAuthFailure) {
+        console.warn(`[AetramMD] Session expired/invalid (status=${status}) during search for "${searchString}". Clearing session.`);
         clearAetramSession();
         broadcastBrokerStatus("session-expired", "Broker session expired. Please login again.", "module2");
-      } else {
-        console.error(`[AetramMD] Instrument search error for "${searchString}":`, error?.message || error);
       }
       return [];
     } finally {
@@ -278,7 +361,7 @@ export const resolveOptionStrikeToken = async (
   if (!matchInst) {
     const availableExpiries = Array.from(new Set(candidateMatches.map(c => c.ymd).filter(Boolean))).sort();
     console.log(`[INSTRUMENT][EXPIRY] Requested: ${targetYmd}, Available: ${availableExpiries.join(", ")}`);
-    
+
     // Select closest available expiry
     matchInst = candidateMatches.sort((a, b) => {
       const diffA = Math.abs(new Date(a.ymd).getTime() - new Date(targetYmd).getTime());
@@ -417,8 +500,8 @@ export const unsubscribeFromInstruments = async (
     };
     const payloadOI = { ...payload, xtsMessageCode: 1510 };
 
-    await axios.put(`${baseUrl}/instruments/subscription`, payload, { headers: getHeaders(), timeout: 10000 }).catch(() => {});
-    await axios.put(`${baseUrl}/instruments/subscription`, payloadOI, { headers: getHeaders(), timeout: 10000 }).catch(() => {});
+    await axios.put(`${baseUrl}/instruments/subscription`, payload, { headers: getHeaders(), timeout: 10000 }).catch(() => { });
+    await axios.put(`${baseUrl}/instruments/subscription`, payloadOI, { headers: getHeaders(), timeout: 10000 }).catch(() => { });
 
     for (const inst of uniqueInstruments) {
       const key = `${inst.segment}|${inst.token}`;
@@ -513,18 +596,32 @@ const triggerReconnectCallback = () => {
 
 marketDataEvents.on("CONNECTED", () => {
   console.log("[AetramMD] Socket connected.");
-  broadcastBrokerStatus("live", undefined, "module2");
-  triggerReconnectCallback();
+  console.log("[AETRAM][WS] connected");
+  clearActiveSubscribedMap();
+  if (isMarketDataAuthenticated()) {
+    broadcastBrokerStatus("live", undefined, "module2");
+    triggerReconnectCallback();
+  } else {
+    console.warn("[AetramMD] Socket connected but session is unauthenticated. Skipping live broadcast.");
+  }
 });
 
 marketDataEvents.on("RECONNECTED", () => {
   console.log("[AetramMD] Socket reconnected.");
-  broadcastBrokerStatus("live", undefined, "module2");
-  triggerReconnectCallback();
+  console.log("[AETRAM][WS] reconnected");
+  clearActiveSubscribedMap();
+  if (isMarketDataAuthenticated()) {
+    broadcastBrokerStatus("live", undefined, "module2");
+    triggerReconnectCallback();
+  } else {
+    console.warn("[AetramMD] Socket reconnected but session is unauthenticated. Skipping live broadcast.");
+  }
 });
 
 marketDataEvents.on("DISCONNECTED", ({ reason, manual }: { reason: string; manual: boolean }) => {
   console.warn(`[AetramMD] Socket disconnected: ${reason}`);
+  console.log(`[AETRAM][WS] disconnect reason=${reason}`);
+  clearActiveSubscribedMap();
   if (!manual) {
     broadcastBrokerStatus("broker-disconnected", "Lost connection to broker. Reconnecting...", "module2");
   }
@@ -557,6 +654,8 @@ const computeUpcomingThursdays = (count: number): string[] => {
 export const getAetramExpiryDates = async (indexSymbol: string, exchangeSegment = 2): Promise<string[]> => {
   const baseUrl = getBaseUrl();
 
+  console.log(`[AETRAM][EXPIRY] request started for ${indexSymbol}`);
+
   if (baseUrl) {
     if (!getMarketDataToken()) {
       await loginToAetram();
@@ -588,13 +687,21 @@ export const getAetramExpiryDates = async (indexSymbol: string, exchangeSegment 
 
         if (uniqueExpiries.size > 0) {
           const sorted = Array.from(uniqueExpiries).sort();
+          console.log(`[AETRAM][EXPIRY] response status=200`);
+          console.log(`[AETRAM][EXPIRY] expiry count=${sorted.length}`);
           console.log(`[AetramMD] Dynamic expiries found for ${indexSymbol}: ${sorted.length} dates [${sorted.slice(0, 5).join(", ")}...]`);
           return sorted;
         }
       } catch (e: any) {
-        console.warn(`[AetramMD] Failed to fetch real expiries for ${indexSymbol}: ${e.message}. Falling back.`);
+        console.warn(`[AetramMD] Failed to fetch real expiries for ${indexSymbol}: ${e.message}.`);
+        throw e;
       }
     }
+  }
+
+  // If unauthenticated, throw error so controller returns 401 instead of generating fake expiries
+  if (!isMarketDataAuthenticated()) {
+    throw new Error("Broker session expired or unauthenticated.");
   }
 
   const configDates = (process.env.MOD2_EXPIRY_DATES || "").trim();
@@ -612,7 +719,8 @@ import { MarketDataLoginResult } from "./marketDataSessionService";
  * Called by module2BrokerLogin controller — never called on server startup.
  */
 export const loginToAetramWithCredentials = async (appKey: string, secretKey: string): Promise<MarketDataLoginResult> => {
-  return await loginMarketData(appKey, secretKey);
+  clearSearchCache();
+  return await loginMarketData(appKey, secretKey, true);
 };
 
 /**

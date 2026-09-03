@@ -58,12 +58,10 @@ const dedupeByInstrumentId = (records: SubscriptionRecord[]): SubscriptionRecord
   return deduped;
 };
 
+import { syncAetramSubscriptions } from "./trackerService";
+
 const syncActiveSubscriptions = async (trigger: SyncTrigger): Promise<void> => {
   if (syncing) {
-    // Don't drop it — a subscription registered mid-sync must still reach the
-    // broker. Record it and re-run once the in-flight sync finishes; that
-    // re-run always reads the registry fresh, so it naturally includes
-    // whatever prompted this trigger.
     console.warn(`[SubscriptionSync] Sync already in progress — deferring trigger (${trigger}) until it completes.`);
     pendingRetrigger = trigger;
     return;
@@ -76,31 +74,26 @@ const syncActiveSubscriptions = async (trigger: SyncTrigger): Promise<void> => {
     const deduped = dedupeByInstrumentId(active);
     const skipped = active.length - deduped.length;
 
-    if (deduped.length === 0) {
-      console.log(`[SubscriptionSync] ${trigger} — no active subscriptions to synchronize.`);
-      state = "SYNCED";
-      lastSyncedAt = new Date();
-      lastSyncCount = 0;
-      lastError = null;
-      return;
+    if (deduped.length > 0) {
+      console.log(
+        `[SubscriptionSync] ${trigger} — synchronizing ${deduped.length} active registry subscription(s)` +
+        (skipped > 0 ? ` (${skipped} cross-session duplicate(s) skipped).` : ".")
+      );
+      await subscribeToInstruments(deduped.map((r) => ({ segment: r.exchangeSegment, token: r.exchangeInstrumentID })));
+      marketDataEvents.emit("SUBSCRIBED", {
+        count: deduped.length,
+        exchangeInstrumentIDs: deduped.map((r) => r.exchangeInstrumentID),
+      });
     }
 
-    console.log(
-      `[SubscriptionSync] ${trigger} — synchronizing ${deduped.length} active subscription(s)` +
-      (skipped > 0 ? ` (${skipped} cross-session duplicate(s) skipped).` : ".")
-    );
-
-    await subscribeToInstruments(deduped.map((r) => ({ segment: r.exchangeSegment, token: r.exchangeInstrumentID })));
+    // Always synchronize active tracker sessions on reconnect/connected
+    const trackerSynced = await syncAetramSubscriptions(trigger === "RECONNECTED");
 
     state = "SYNCED";
     lastSyncedAt = new Date();
     lastSyncCount = deduped.length;
     lastError = null;
-    marketDataEvents.emit("SUBSCRIBED", {
-      count: deduped.length,
-      exchangeInstrumentIDs: deduped.map((r) => r.exchangeInstrumentID),
-    });
-    console.log(`[SubscriptionSync] Synchronized ${deduped.length} subscription(s).`);
+    console.log(`[SubscriptionSync] Synchronized subscriptions complete (trigger=${trigger}, trackerSynced=${trackerSynced}).`);
   } catch (err: any) {
     state = "FAILED";
     lastError = err?.message || String(err);
