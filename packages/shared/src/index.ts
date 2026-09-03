@@ -135,4 +135,5 @@ export interface UserSession {
 }
 
 export * from "./timeUtils";
+export { generateTimelineColumns, formatISTTime, normalizeCandleTimestamp, getISTMinuteBucket, getMinutesSinceMarketOpenIST } from "./timeUtils";
 

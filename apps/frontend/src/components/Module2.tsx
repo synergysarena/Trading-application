@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { useQuery, useMutation } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useStore } from "../store/useStore";
+import { generateTimelineColumns } from "@stock/shared";
 import { api } from "../utils/api";
 import { exportModule2ToExcel } from "../utils/excelModule2Export";
 import { colorClassStyle } from "../modules/dashboard/cellColorRules";
@@ -363,11 +364,11 @@ function MultiSelectStrikeDropdown({
 }
 
 export const Module2 = ({ isSplit = false }: { isSplit?: boolean }) => {
+  const queryClient = useQueryClient();
   const activeSession = useStore((s) => s.activeSession);
   const setActiveSession = useStore((s) => s.setActiveSession);
   const module2BrokerStatus = useStore((s) => s.module2BrokerStatus);
   const [isConfigExpanded, setIsConfigExpanded] = useState(!isSplit);
-
 
   const [indexSymbol, setIndexSymbol] = useState("NIFTY50");
   const [expiryDate, setExpiryDate] = useState("");
@@ -407,7 +408,7 @@ export const Module2 = ({ isSplit = false }: { isSplit?: boolean }) => {
   const [selectedOHLCFields, setSelectedOHLCFields] = useState<string[]>(["open", "high", "low", "close"]);
 
   // 1. Index Symbol Query (API-driven)
-  const { data: indexesData, isLoading: isIndexesLoading, isError: isIndexesError } = useQuery({
+  const { data: indexesData, isLoading: isIndexesLoading, isError: isIndexesError, refetch: refetchIndexes } = useQuery({
     queryKey: ["module2-indexes"],
     queryFn: async () => {
       console.log("[MODULE2][CONFIG] Loading indexes");
@@ -438,7 +439,7 @@ export const Module2 = ({ isSplit = false }: { isSplit?: boolean }) => {
   }, [indexesData, indexSymbol]);
 
   // 2. Options Expiry Query (API-driven)
-  const { data: expiriesData, isLoading: isExpiriesLoading, isError: isExpiriesError } = useQuery({
+  const { data: expiriesData, isLoading: isExpiriesLoading, isError: isExpiriesError, refetch: refetchExpiries, isFetching: isExpiriesFetching } = useQuery({
     queryKey: ["module2-expiries", indexSymbol],
     queryFn: async () => {
       console.log(`[MODULE2][CONFIG] Loading expiries for ${indexSymbol}`);
@@ -488,7 +489,7 @@ export const Module2 = ({ isSplit = false }: { isSplit?: boolean }) => {
   }, [expiryDate]);
 
   // 3. Option Chain / Strikes Query (API-driven)
-  const { data: chainData, isLoading: isStrikesLoading } = useQuery({
+  const { data: chainData, isLoading: isStrikesLoading, isFetching: isChainFetching } = useQuery({
     queryKey: ["module2-option-chain", indexSymbol, expiryDate],
     queryFn: async () => {
       console.log(`[MODULE2][CONFIG] Loading option contracts for ${indexSymbol} @ ${expiryDate}`);
@@ -513,6 +514,83 @@ export const Module2 = ({ isSplit = false }: { isSplit?: boolean }) => {
     staleTime: 5 * 60 * 1000,
     retry: 1,
   });
+
+  // Preserve valid selected strikes when chainData is refreshed
+  useEffect(() => {
+    if (chainData?.strikes && chainData.strikes.length > 0 && selectedStrikes.length > 0) {
+      const availableSymbols = new Set<string>();
+      chainData.strikes.forEach((s: any) => {
+        if (s.CE) availableSymbols.add(s.CE);
+        if (s.PE) availableSymbols.add(s.PE);
+      });
+      setSelectedStrikes((prev) => {
+        const filtered = prev.filter((s) => availableSymbols.has(s));
+        return filtered.length === prev.length ? prev : filtered;
+      });
+    }
+  }, [chainData]);
+
+  // Module 2 Configuration Refresh Handler
+  const [isRefreshingConfig, setIsRefreshingConfig] = useState(false);
+  const handleRefreshConfig = async () => {
+    if (isRefreshingConfig) return;
+    setIsRefreshingConfig(true);
+    setStrikeWarning(null);
+    try {
+      console.log(`[MODULE2][REFRESH] symbol=${indexSymbol} expiry=${expiryDate}`);
+
+      // 1. Invalidate indexes and fetch latest
+      await queryClient.invalidateQueries({ queryKey: ["module2-indexes"] });
+      await refetchIndexes();
+
+      // 2. Invalidate expiries and fetch latest
+      await queryClient.invalidateQueries({ queryKey: ["module2-expiries", indexSymbol] });
+      const expiriesResult: any = await refetchExpiries();
+      const expiries: string[] = expiriesResult?.data?.expiries || expiriesData?.expiries || [];
+
+      // 3. Determine active target expiry: preserve current if still present, otherwise first available
+      let targetExpiry = expiryDate;
+      if (!targetExpiry || !expiries.includes(targetExpiry)) {
+        targetExpiry = expiries.length > 0 ? expiries[0] : "";
+        if (targetExpiry !== expiryDate) {
+          setExpiryDate(targetExpiry);
+        }
+      }
+
+      // 4. Force fresh option-chain fetch for the target expiry with staleTime: 0
+      if (targetExpiry) {
+        console.log(`[MODULE2][REFRESH] Loading option chain for ${indexSymbol} @ ${targetExpiry}`);
+        await queryClient.invalidateQueries({ queryKey: ["module2-option-chain", indexSymbol, targetExpiry] });
+        const chainRes: any = await queryClient.fetchQuery({
+          queryKey: ["module2-option-chain", indexSymbol, targetExpiry],
+          queryFn: async () => {
+            console.log(`[MODULE2][CONFIG] Loading option contracts for ${indexSymbol} @ ${targetExpiry}`);
+            const res = await api.get(`/api/module2/option-chain?symbol=${indexSymbol}&expiry=${targetExpiry}`);
+            return res;
+          },
+          staleTime: 0,
+        });
+
+        const strikes = chainRes?.strikes || [];
+        let ceCount = 0;
+        let peCount = 0;
+        strikes.forEach((s: any) => {
+          if (s.CE) ceCount++;
+          if (s.PE) peCount++;
+        });
+
+        console.log(`[MODULE2][REFRESH][CHAIN] contracts=${strikes.length} CE=${ceCount} PE=${peCount}`);
+        console.log(`[MODULE2][REFRESH][STRIKES] CE=${ceCount} PE=${peCount}`);
+      }
+
+      console.log("[MODULE2][CONFIG] Manual configuration refresh complete");
+    } catch (err: any) {
+      console.error("[MODULE2][CONFIG] Manual configuration refresh failed:", err);
+      setStrikeWarning("Failed to refresh configuration: " + (err?.message || "Unknown error"));
+    } finally {
+      setIsRefreshingConfig(false);
+    }
+  };
 
   const availableStrikesList: any[] = chainData?.strikes || [];
 
@@ -683,13 +761,14 @@ export const Module2 = ({ isSplit = false }: { isSplit?: boolean }) => {
 
   const sortedTimestamps = useMemo(() => {
     if (!currentSession?.strikes) return [];
-    const tsSet = new Set<string>();
+    const rawTsList: string[] = [];
     Object.values(currentSession.strikes).forEach((s: any) => {
       s.grid?.forEach((c: any) => {
-        if (c.timestamp) tsSet.add(c.timestamp);
+        if (c.timestamp) rawTsList.push(c.timestamp);
       });
     });
-    return Array.from(tsSet).sort((a, b) => a.localeCompare(b));
+    const continuousTimeline = generateTimelineColumns(rawTsList);
+    return continuousTimeline;
   }, [currentSession?.strikes]);
 
   // All selected strikes are displayed always
@@ -878,24 +957,52 @@ export const Module2 = ({ isSplit = false }: { isSplit?: boolean }) => {
                 borderRadius: 14, padding: "18px 22px",
                 boxShadow: "0 1px 8px rgba(0,0,0,0.05)", animationDelay: "0.04s",
                 position: "relative",
-                zIndex: 50,
+                zIndex: 1,
               }}
             >
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
                 <span style={{ fontFamily: "'Inter', sans-serif", fontSize: 11, fontWeight: 700, color: "var(--trading-text-muted)", textTransform: "uppercase", letterSpacing: "0.15em" }}>
                   Configuration & Strikes
                 </span>
-                {isSplit && (
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                   <button
-                    onClick={() => setIsConfigExpanded(false)}
+                    onClick={handleRefreshConfig}
+                    disabled={isRefreshingConfig || isExpiriesFetching || isChainFetching}
                     style={{
-                      background: "rgba(4,120,87,0.08)", border: "none", color: GREEN,
-                      fontWeight: 700, fontSize: 11, cursor: "pointer", padding: "4px 10px", borderRadius: 5
+                      fontFamily: "'Inter', sans-serif",
+                      fontSize: 11,
+                      fontWeight: 700,
+                      padding: "4px 12px",
+                      borderRadius: 6,
+                      border: "1.5px solid var(--trading-border, #d8e0ea)",
+                      background: isRefreshingConfig ? "rgba(4,120,87,0.08)" : "var(--trading-surface, #ffffff)",
+                      color: isRefreshingConfig ? GREEN : "var(--trading-text-muted, #475569)",
+                      cursor: (isRefreshingConfig || isExpiriesFetching || isChainFetching) ? "not-allowed" : "pointer",
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: 6,
+                      transition: "all 0.15s",
+                      opacity: (isRefreshingConfig || isExpiriesFetching || isChainFetching) ? 0.75 : 1,
                     }}
+                    title="Refresh Module 2 configuration and strikes"
                   >
-                    Hide Config ▲
+                    <span style={{ display: "inline-block", transform: isRefreshingConfig ? "rotate(180deg)" : "none", transition: "transform 0.5s" }}>
+                      ↻
+                    </span>
+                    <span>{isRefreshingConfig ? "Refreshing…" : "Refresh"}</span>
                   </button>
-                )}
+                  {isSplit && (
+                    <button
+                      onClick={() => setIsConfigExpanded(false)}
+                      style={{
+                        background: "rgba(4,120,87,0.08)", border: "none", color: GREEN,
+                        fontWeight: 700, fontSize: 11, cursor: "pointer", padding: "4px 10px", borderRadius: 5
+                      }}
+                    >
+                      Hide Config ▲
+                    </button>
+                  )}
+                </div>
               </div>
 
               {/* 1. Main 4-Column Layout (SYMBOL, EXPIRY DATE, CALL STRIKE, PUT STRIKE) */}
@@ -921,8 +1028,8 @@ export const Module2 = ({ isSplit = false }: { isSplit?: boolean }) => {
                   selectedStrikes={selectedStrikes}
                   onToggleStrike={handleToggleCE}
                   onClear={() => setSelectedStrikes((prev) => prev.filter((s) => !s.toUpperCase().endsWith("CE")))}
-                  disabled={!expiryDate || isStrikesLoading || !!activeSession}
-                  loading={isStrikesLoading}
+                  disabled={!expiryDate || isStrikesLoading || isRefreshingConfig || !!activeSession}
+                  loading={isStrikesLoading || isRefreshingConfig}
                   maxLimit={10}
                   placeholder="Select Call Strikes…"
                 />
@@ -933,8 +1040,8 @@ export const Module2 = ({ isSplit = false }: { isSplit?: boolean }) => {
                   selectedStrikes={selectedStrikes}
                   onToggleStrike={handleTogglePE}
                   onClear={() => setSelectedStrikes((prev) => prev.filter((s) => !s.toUpperCase().endsWith("PE")))}
-                  disabled={!expiryDate || isStrikesLoading || !!activeSession}
-                  loading={isStrikesLoading}
+                  disabled={!expiryDate || isStrikesLoading || isRefreshingConfig || !!activeSession}
+                  loading={isStrikesLoading || isRefreshingConfig}
                   maxLimit={10}
                   placeholder="Select Put Strikes…"
                 />
@@ -1066,6 +1173,8 @@ export const Module2 = ({ isSplit = false }: { isSplit?: boolean }) => {
                   borderRadius: 10, padding: "10px 16px",
                   display: "flex", justifyContent: "space-between", alignItems: "center",
                   boxShadow: "0 1px 4px rgba(0,0,0,0.04)", cursor: "pointer",
+                  position: "relative",
+                  zIndex: 1,
                 }}
                 onClick={() => setIsConfigExpanded(true)}
               >

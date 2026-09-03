@@ -112,3 +112,33 @@ export const normalizeCandleTimestamp = (timestamp?: Date | string | number | nu
     fullIso: d.toISOString(),
   };
 };
+
+/**
+ * Generates continuous 1-minute time columns ("HH:mm") across the union of all provided timestamps.
+ * Gaps between disjoint active periods are preserved as timeline columns so inactive intervals render as dashes '—'.
+ * Example: ["14:23", "14:27", "14:30"] -> ["14:23", "14:24", "14:25", "14:26", "14:27", "14:28", "14:29", "14:30"]
+ */
+export const generateTimelineColumns = (timestamps: string[]): string[] => {
+  if (!timestamps || timestamps.length === 0) return [];
+
+  const validTimes = timestamps.filter((t) => typeof t === "string" && /^\d{2}:\d{2}$/.test(t));
+  if (validTimes.length === 0) return [];
+
+  const toTotalMinutes = (t: string): number => {
+    const [h, m] = t.split(":").map(Number);
+    return h * 60 + m;
+  };
+
+  const minutesList = validTimes.map(toTotalMinutes);
+  const minMinutes = Math.min(...minutesList);
+  const maxMinutes = Math.max(...minutesList);
+
+  const columns: string[] = [];
+  for (let m = minMinutes; m <= maxMinutes; m++) {
+    const hh = String(Math.floor(m / 60)).padStart(2, "0");
+    const mm = String(m % 60).padStart(2, "0");
+    columns.push(`${hh}:${mm}`);
+  }
+
+  return columns;
+};

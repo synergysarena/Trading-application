@@ -15,6 +15,8 @@ import {
   Module2SessionData
 } from "@stock/shared";
 
+const inFlightStarts = new Map<string, Promise<Module2SessionData>>();
+
 // Start Module 2 Session
 export const startSession = async (req: AuthenticatedRequest, res: Response) => {
   console.log("[MODULE2][TRACKER] Request received at backend /api/module2/session/start");
@@ -41,15 +43,27 @@ export const startSession = async (req: AuthenticatedRequest, res: Response) => 
     console.log("[MODULE2][TRACKER] Selected strikes:", selectedStrikes);
     console.log("[MODULE2][TRACKER] Strike count:", selectedStrikes?.length);
 
-    // Start new session
-    console.log("[MODULE2][TRACKER] Calling startTrackerSession...");
-    const session = await startTrackerSession(
-      userId,
-      sessionType,
-      indexSymbol,
-      expiryDate,
-      selectedStrikes
-    );
+    const startKey = `${userId}:${indexSymbol}:${expiryDate}`;
+
+    // If an identical start request is already in-flight for this user/symbol, coalesce to the existing promise
+    let startPromise = inFlightStarts.get(startKey);
+    if (!startPromise) {
+      console.log("[MODULE2][TRACKER] Calling startTrackerSession...");
+      startPromise = startTrackerSession(
+        userId,
+        sessionType,
+        indexSymbol,
+        expiryDate,
+        selectedStrikes
+      ).finally(() => {
+        inFlightStarts.delete(startKey);
+      });
+      inFlightStarts.set(startKey, startPromise);
+    } else {
+      console.log(`[MODULE2][TRACKER] Coalescing duplicate concurrent start request for ${startKey}`);
+    }
+
+    const session = await startPromise;
 
     console.log("[MODULE2][TRACKER] startTrackerSession returned:", session ? "Session Data" : "null/undefined");
     if (session) {

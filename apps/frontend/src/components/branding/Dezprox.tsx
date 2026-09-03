@@ -22,8 +22,8 @@ export function DezproxMark({ }: MarkProps) {
       <path d="M16.2715 320.521L16.2715 147.195C48.5119 147.195 74.6479 173.331 74.6479 205.572V320.521H16.2715Z" fill="url(#paint0_linear_1843_786)" />
       <path d="M16.2715 3H118.088V60.1585H73.43C41.8622 60.1585 16.2715 34.5678 16.2715 3Z" fill="url(#paint1_linear_1843_786)" />
       <path d="M16.2715 320.99C16.2715 289.422 41.8622 263.832 73.43 263.832H118.088V320.99H16.2715Z" fill="url(#paint2_linear_1843_786)" />
-      <path d="M274.52 161.773C274.52 203.085 258.076 242.706 228.805 271.92C200.226 300.442 161.723 317.175 121.431 317.968V266.782C148.068 265.954 173.377 254.155 192.182 235.388C211.743 215.865 222.733 189.385 222.733 161.773C222.733 134.162 211.743 107.683 192.182 88.1602C173.355 69.3706 148.039 58.0038 121.431 57.2061V6.03125C161.744 6.80377 200.241 23.1195 228.805 51.627C258.076 80.8406 274.519 120.462 274.52 161.773Z" fill="url(#paint3_linear_1843_786)" stroke="url(#paint4_linear_1843_786)" stroke-width="6" />
-      <path d="M222.803 161.773C222.803 203.085 239.246 242.706 268.518 271.92C297.082 300.428 336.001 316.927 376.335 317.708V266.782C349.68 265.955 323.955 254.165 305.141 235.388C285.579 215.865 274.589 189.385 274.589 161.773C274.589 134.162 285.579 107.683 305.141 88.1602C323.968 69.3706 349.284 58.0038 375.892 57.2061V6.03125C335.578 6.80378 297.082 23.1195 268.518 51.627C239.246 80.8406 222.803 120.462 222.803 161.773Z" fill="url(#paint5_linear_1843_786)" stroke="url(#paint6_linear_1843_786)" stroke-width="6" />
+      <path d="M274.52 161.773C274.52 203.085 258.076 242.706 228.805 271.92C200.226 300.442 161.723 317.175 121.431 317.968V266.782C148.068 265.954 173.377 254.155 192.182 235.388C211.743 215.865 222.733 189.385 222.733 161.773C222.733 134.162 211.743 107.683 192.182 88.1602C173.355 69.3706 148.039 58.0038 121.431 57.2061V6.03125C161.744 6.80377 200.241 23.1195 228.805 51.627C258.076 80.8406 274.519 120.462 274.52 161.773Z" fill="url(#paint3_linear_1843_786)" stroke="url(#paint4_linear_1843_786)" strokeWidth="6" />
+      <path d="M222.803 161.773C222.803 203.085 239.246 242.706 268.518 271.92C297.082 300.428 336.001 316.927 376.335 317.708V266.782C349.68 265.955 323.955 254.165 305.141 235.388C285.579 215.865 274.589 189.385 274.589 161.773C274.589 134.162 285.579 107.683 305.141 88.1602C323.968 69.3706 349.284 58.0038 375.892 57.2061V6.03125C335.578 6.80378 297.082 23.1195 268.518 51.627C239.246 80.8406 222.803 120.462 222.803 161.773Z" fill="url(#paint5_linear_1843_786)" stroke="url(#paint6_linear_1843_786)" strokeWidth="6" />
       <g filter="url(#filter0_dddd_1843_786)">
         <path d="M378.546 3H480.363C480.363 34.5678 454.773 60.1585 423.205 60.1585H378.546C363.838 43.2905 320.047 17.7108 271.303 44.5108C284.544 31.1594 326.281 3 378.546 3Z" fill="url(#paint7_linear_1843_786)" />
       </g>
@@ -37,8 +37,8 @@ export function DezproxMark({ }: MarkProps) {
         <path d="M119.182 320.875H17.3652C17.3652 289.307 42.956 263.717 74.5238 263.717H119.182C133.89 280.585 175.128 306.903 223.872 280.103C210.631 293.454 171.447 320.875 119.182 320.875Z" fill="url(#paint10_linear_1843_786)" />
       </g>
       <defs>
-        <filter id="filter0_dddd_1843_786" x="254.303" y="0" width="243.061" height="119.158" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
-          <feFlood flood-opacity="0" result="BackgroundImageFix" />
+        <filter id="filter0_dddd_1843_786" x="254.303" y="0" width="243.061" height="119.158" filterUnits="userSpaceOnUse" colorInterpolationFilters="sRGB">
+          <feFlood floodOpacity="0" result="BackgroundImageFix" />
           <feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha" />
           <feOffset dy="3" />
           <feGaussianBlur stdDeviation="3" />
@@ -61,8 +61,8 @@ export function DezproxMark({ }: MarkProps) {
           <feBlend mode="normal" in2="effect3_dropShadow_1843_786" result="effect4_dropShadow_1843_786" />
           <feBlend mode="normal" in="SourceGraphic" in2="effect4_dropShadow_1843_786" result="shape" />
         </filter>
-        <filter id="filter1_dddd_1843_786" x="0" y="0" width="240.872" height="119.158" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
-          <feFlood flood-opacity="0" result="BackgroundImageFix" />
+        <filter id="filter1_dddd_1843_786" x="0" y="0" width="240.872" height="119.158" filterUnits="userSpaceOnUse" colorInterpolationFilters="sRGB">
+          <feFlood floodOpacity="0" result="BackgroundImageFix" />
           <feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha" />
           <feOffset dy="3" />
           <feGaussianBlur stdDeviation="3" />
@@ -85,8 +85,8 @@ export function DezproxMark({ }: MarkProps) {
           <feBlend mode="normal" in2="effect3_dropShadow_1843_786" result="effect4_dropShadow_1843_786" />
           <feBlend mode="normal" in="SourceGraphic" in2="effect4_dropShadow_1843_786" result="shape" />
         </filter>
-        <filter id="filter2_dddd_1843_786" x="256.397" y="206.717" width="239.601" height="117.158" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
-          <feFlood flood-opacity="0" result="BackgroundImageFix" />
+        <filter id="filter2_dddd_1843_786" x="256.397" y="206.717" width="239.601" height="117.158" filterUnits="userSpaceOnUse" colorInterpolationFilters="sRGB">
+          <feFlood floodOpacity="0" result="BackgroundImageFix" />
           <feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha" />
           <feOffset dy="-3" />
           <feGaussianBlur stdDeviation="3" />
@@ -109,8 +109,8 @@ export function DezproxMark({ }: MarkProps) {
           <feBlend mode="normal" in2="effect3_dropShadow_1843_786" result="effect4_dropShadow_1843_786" />
           <feBlend mode="normal" in="SourceGraphic" in2="effect4_dropShadow_1843_786" result="shape" />
         </filter>
-        <filter id="filter3_dddd_1843_786" x="1.36523" y="206.717" width="238.507" height="117.158" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
-          <feFlood flood-opacity="0" result="BackgroundImageFix" />
+        <filter id="filter3_dddd_1843_786" x="1.36523" y="206.717" width="238.507" height="117.158" filterUnits="userSpaceOnUse" colorInterpolationFilters="sRGB">
+          <feFlood floodOpacity="0" result="BackgroundImageFix" />
           <feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha" />
           <feOffset dy="-3" />
           <feGaussianBlur stdDeviation="3" />
@@ -134,48 +134,48 @@ export function DezproxMark({ }: MarkProps) {
           <feBlend mode="normal" in="SourceGraphic" in2="effect4_dropShadow_1843_786" result="shape" />
         </filter>
         <linearGradient id="paint0_linear_1843_786" x1="16.2715" y1="146.847" x2="76.8382" y2="237.706" gradientUnits="userSpaceOnUse">
-          <stop stop-color="#227631" />
-          <stop offset="1" stop-color="#3FA740" />
+          <stop stopColor="#227631" />
+          <stop offset="1" stopColor="#3FA740" />
         </linearGradient>
         <linearGradient id="paint1_linear_1843_786" x1="67.1799" y1="3" x2="67.1799" y2="60.1585" gradientUnits="userSpaceOnUse">
-          <stop stop-color="#227631" />
-          <stop offset="1" stop-color="#3FA740" />
+          <stop stopColor="#227631" />
+          <stop offset="1" stopColor="#3FA740" />
         </linearGradient>
         <linearGradient id="paint2_linear_1843_786" x1="67.1799" y1="263.832" x2="67.1799" y2="320.99" gradientUnits="userSpaceOnUse">
-          <stop stop-color="#227631" />
-          <stop offset="1" stop-color="#3FA740" />
+          <stop stopColor="#227631" />
+          <stop offset="1" stopColor="#3FA740" />
         </linearGradient>
         <linearGradient id="paint3_linear_1843_786" x1="197.975" y1="3" x2="197.975" y2="321" gradientUnits="userSpaceOnUse">
-          <stop stop-color="#227631" />
-          <stop offset="1" stop-color="#3FA740" />
+          <stop stopColor="#227631" />
+          <stop offset="1" stopColor="#3FA740" />
         </linearGradient>
         <linearGradient id="paint4_linear_1843_786" x1="277.52" y1="162" x2="118.431" y2="162" gradientUnits="userSpaceOnUse">
-          <stop stop-color="#227631" />
-          <stop offset="1" stop-color="#3FA740" />
+          <stop stopColor="#227631" />
+          <stop offset="1" stopColor="#3FA740" />
         </linearGradient>
         <linearGradient id="paint5_linear_1843_786" x1="299.569" y1="3" x2="299.569" y2="320.74" gradientUnits="userSpaceOnUse">
-          <stop stop-color="#227631" />
-          <stop offset="1" stop-color="#3FA740" />
+          <stop stopColor="#227631" />
+          <stop offset="1" stopColor="#3FA740" />
         </linearGradient>
         <linearGradient id="paint6_linear_1843_786" x1="219.803" y1="161.87" x2="379.335" y2="161.87" gradientUnits="userSpaceOnUse">
-          <stop stop-color="#227631" />
-          <stop offset="1" stop-color="#3FA740" />
+          <stop stopColor="#227631" />
+          <stop offset="1" stopColor="#3FA740" />
         </linearGradient>
         <linearGradient id="paint7_linear_1843_786" x1="365.8" y1="31.4021" x2="480.363" y2="31.5799" gradientUnits="userSpaceOnUse">
-          <stop stop-color="#227631" />
-          <stop offset="1" stop-color="#3FA740" />
+          <stop stopColor="#227631" />
+          <stop offset="1" stopColor="#3FA740" />
         </linearGradient>
         <linearGradient id="paint8_linear_1843_786" x1="131.564" y1="31.4021" x2="17" y2="31.5799" gradientUnits="userSpaceOnUse">
-          <stop stop-color="#227631" />
-          <stop offset="1" stop-color="#3FA740" />
+          <stop stopColor="#227631" />
+          <stop offset="1" stopColor="#3FA740" />
         </linearGradient>
         <linearGradient id="paint9_linear_1843_786" x1="365.434" y1="292.473" x2="479.998" y2="292.295" gradientUnits="userSpaceOnUse">
-          <stop stop-color="#227631" />
-          <stop offset="1" stop-color="#3FA740" />
+          <stop stopColor="#227631" />
+          <stop offset="1" stopColor="#3FA740" />
         </linearGradient>
         <linearGradient id="paint10_linear_1843_786" x1="131.929" y1="292.473" x2="17.3653" y2="292.295" gradientUnits="userSpaceOnUse">
-          <stop stop-color="#227631" />
-          <stop offset="1" stop-color="#3FA740" />
+          <stop stopColor="#227631" />
+          <stop offset="1" stopColor="#3FA740" />
         </linearGradient>
       </defs>
     </svg>

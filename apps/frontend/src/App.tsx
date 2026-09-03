@@ -88,7 +88,7 @@ function ModuleTopBar({
       <header style={{
         height: 60, display: "flex", alignItems: "center", justifyContent: "space-between",
         padding: "0 24px", background: "#ffffff", borderBottom: "1.5px solid #d8e0ea",
-        position: "sticky", top: 0, zIndex: 30,
+        position: "sticky", top: 0, zIndex: 100,
         boxShadow: "0 1px 4px rgba(15,32,51,0.06)",
       }}>
         <div style={{ display: "flex", alignItems: "center", gap: 16 }}>

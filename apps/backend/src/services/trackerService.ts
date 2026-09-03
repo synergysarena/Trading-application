@@ -1,6 +1,7 @@
+import mongoose from "mongoose";
 import { Module2Session } from "../models/Module2Session";
 import { Module2StrikeTick } from "../models/Module2StrikeTick";
-import { readLive } from "./redisWriteBuffer";
+import { readLive, readLiveBatch } from "./redisWriteBuffer";
 import { broadcastTrackerUpdate } from "./socketService";
 import {
   Module2SessionData,
@@ -471,10 +472,10 @@ const executeMinuteBoundary = async () => {
   }
 };
 
-
 /**
  * Starts a new Module 2 tracking session with persistent historical strike stitching
  */
+
 export const startTrackerSession = async (
   userId: string,
   sessionType: "CE" | "PE" | "mixed",
@@ -482,34 +483,93 @@ export const startTrackerSession = async (
   expiryDate: string,
   selectedStrikes: string[]
 ): Promise<Module2SessionData> => {
+  const startTime = Date.now();
   console.log(`[MODULE2-TRACKER] START REQUEST userId=${userId} index=${indexSymbol} expiry=${expiryDate} strikes=${selectedStrikes.length}`);
 
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
-  // Find previous sessions from today for this user, symbol, and expiry to restore historical strike data
+  // 1. Find previous sessions from today with a 1500ms bounded timeout if DB is connected
   let previousSessionIds: any[] = [];
   const existingStrikeStartBoundaries: Record<string, string> = {};
-  try {
-    const previousDocs = await Module2Session.find({
-      user_id: userId,
-      index_symbol: indexSymbol,
-      expiry_date: expiryDate,
-      created_at: { $gte: today },
-    }).select("_id strike_start_boundaries day_open_prices_json created_at").lean();
+  if (mongoose.connection.readyState === 1) {
+    try {
+      const timeoutPromise = new Promise<any[]>((_, reject) =>
+        setTimeout(() => reject(new Error("MongoDB previous session query timeout")), 1500)
+      );
+      const normalizedIndices = Array.from(
+        new Set([
+          indexSymbol,
+          indexSymbol.toUpperCase(),
+          indexSymbol.replace("50", ""),
+          indexSymbol.endsWith("50") ? indexSymbol : `${indexSymbol}50`,
+        ])
+      );
+      const previousDocs = await Promise.race([
+        Module2Session.find({
+          user_id: userId,
+          index_symbol: { $in: normalizedIndices },
+          expiry_date: expiryDate,
+          created_at: { $gte: today },
+        }).select("_id strike_start_boundaries day_open_prices_json created_at").lean(),
+        timeoutPromise
+      ]);
 
-    previousSessionIds = previousDocs.map((d: any) => d._id);
-    for (const pDoc of previousDocs) {
-      if (pDoc.strike_start_boundaries) {
-        for (const [s, b] of Object.entries(pDoc.strike_start_boundaries as Record<string, any>)) {
-          if (!existingStrikeStartBoundaries[s] && b) {
-            existingStrikeStartBoundaries[s] = typeof b === "string" ? b : new Date(b).toISOString();
+      previousSessionIds = previousDocs.map((d: any) => d._id);
+      for (const pDoc of previousDocs) {
+        if (pDoc.strike_start_boundaries) {
+          for (const [s, b] of Object.entries(pDoc.strike_start_boundaries as Record<string, any>)) {
+            if (!existingStrikeStartBoundaries[s] && b) {
+              existingStrikeStartBoundaries[s] = typeof b === "string" ? b : new Date(b).toISOString();
+            }
           }
         }
       }
+    } catch (err: any) {
+      console.warn("[MODULE2-TRACKER] Could not query previous sessions for history:", err?.message || err);
     }
-  } catch (err: any) {
-    console.warn("[MODULE2-TRACKER] Could not query previous sessions for history:", err?.message || err);
+  }
+
+  // 2. Pre-fetch all Redis live prices/OI concurrently in ONE batch call
+  const futSymbol = getFuturesSymbol(indexSymbol);
+  const keysToBatch = [
+    ...selectedStrikes.map((s) => `ltp:${s}`),
+    ...selectedStrikes.map((s) => `oi:${s}`),
+    `ltp:${futSymbol}`,
+    `oi:${futSymbol}`,
+  ];
+  const liveDataMap = await readLiveBatch(keysToBatch);
+
+  // 3. Pre-fetch ALL historical ticks for all strikes in ONE single batch query
+  const pastTicksByStrike = new Map<string, any[]>();
+  if (previousSessionIds.length > 0) {
+    try {
+      const timeoutPromise = new Promise<any[]>((_, reject) =>
+        setTimeout(() => reject(new Error("MongoDB past ticks query timeout")), 2500)
+      );
+      const sessionIdsIn = [
+        ...previousSessionIds,
+        ...previousSessionIds
+          .filter((id) => typeof id === "string" && mongoose.isValidObjectId(id))
+          .map((id) => new mongoose.Types.ObjectId(id)),
+      ];
+      const allPastTicks = await Promise.race([
+        Module2StrikeTick.find({
+          session_id: { $in: sessionIdsIn },
+          strike: { $in: selectedStrikes },
+          minute_timestamp: { $gte: today },
+        }).sort({ minute_timestamp: 1 }).lean(),
+        timeoutPromise
+      ]);
+      for (const t of allPastTicks) {
+        if (!pastTicksByStrike.has(t.strike)) {
+          pastTicksByStrike.set(t.strike, []);
+        }
+        pastTicksByStrike.get(t.strike)!.push(t);
+      }
+    } catch (dbErr: any) {
+      console.warn("[MODULE2-TRACKER] Failed to fetch past ticks batch:", dbErr?.message || dbErr);
+    }
   }
 
   const dayOpenPrices: Record<string, number> = {};
@@ -520,28 +580,17 @@ export const startTrackerSession = async (
   const initialTimeString = norm.timeString;
   const currentIsoString = new Date(norm.timestampMs).toISOString();
 
+  // 4. Process all strikes purely in-memory (0ms network calls in loop)
   for (const strike of selectedStrikes) {
-    const rawPrice = await readLive(`ltp:${strike}`);
+    const rawPrice = liveDataMap.get(`ltp:${strike}`);
     const liveLtp = rawPrice ? parseFloat(rawPrice) : 0;
 
-    const rawOi = await readLive(`oi:${strike}`);
+    const rawOi = liveDataMap.get(`oi:${strike}`);
     const liveOi = rawOi ? Math.floor(parseFloat(rawOi)) : 0;
 
-    // 1. Query previously persisted Module2StrikeTick records for this strike from today's sessions
-    let pastTicks: any[] = [];
-    if (previousSessionIds.length > 0) {
-      try {
-        pastTicks = await Module2StrikeTick.find({
-          session_id: { $in: previousSessionIds },
-          strike,
-          minute_timestamp: { $gte: today },
-        }).sort({ minute_timestamp: 1 }).lean();
-      } catch (dbErr) {
-        console.warn(`[MODULE2-TRACKER] Failed to fetch past ticks for strike ${strike}:`, dbErr);
-      }
-    }
+    const pastTicks = pastTicksByStrike.get(strike) || [];
 
-    // 2. Deduplicate past ticks by minute timestamp
+    // Deduplicate past ticks by minute timestamp
     const seenMinutes = new Set<string>();
     const dedupedTicks: any[] = [];
     for (const t of pastTicks) {
@@ -553,6 +602,10 @@ export const startTrackerSession = async (
     }
 
     if (dedupedTicks.length > 0) {
+      const firstTs = dedupedTicks[0].cellNorm.timeString;
+      const lastTs = dedupedTicks[dedupedTicks.length - 1].cellNorm.timeString;
+      console.log(`[MODULE2][HISTORY] strike=${strike} historicalMinutes=${dedupedTicks.length} range=${firstTs}-${lastTs}`);
+
       // Historical data exists from an earlier tracking session today
       const historicalGrid: Module2Cell[] = dedupedTicks.map((t: any) => ({
         ltp: t.ltp_integer,
@@ -683,10 +736,9 @@ export const startTrackerSession = async (
     }
   }
 
-  // Resolve Futures symbols and fetch details
-  const futSymbol = getFuturesSymbol(indexSymbol);
-  const rawFutPrice = await readLive(`ltp:${futSymbol}`);
-  const rawFutOi = await readLive(`oi:${futSymbol}`);
+  // Resolve Futures symbols and fetch details from pre-fetched liveDataMap
+  const rawFutPrice = liveDataMap.get(`ltp:${futSymbol}`);
+  const rawFutOi = liveDataMap.get(`oi:${futSymbol}`);
   const futPrice = rawFutPrice ? parseFloat(rawFutPrice) : 0;
   const futOi = rawFutOi ? Math.floor(parseFloat(rawFutOi)) : 0;
 
@@ -700,30 +752,44 @@ export const startTrackerSession = async (
     oiLow: futOi
   };
 
-  // Create session record in DB
+  // Create session record in DB with a 2500ms bounded timeout
   let sessionId: string;
   let createdAt: Date;
-  try {
-    const doc = await Module2Session.create({
-      user_id: userId,
-      session_type: sessionType,
-      index_symbol: indexSymbol,
-      expiry_date: expiryDate,
-      selected_strikes_json: selectedStrikes,
-      day_open_prices_json: dayOpenPrices,
-      futures_oi_json: futuresOI,
-      status: "ACTIVE",
-      started_at: new Date(),
-      stopped_at: null,
-      strike_start_boundaries: strikeStartBoundaries,
-    });
-    sessionId = doc._id.toString();
-    createdAt = doc.created_at;
-  } catch (dbErr: any) {
-    console.warn(`[MODULE2-TRACKER] DB save error (${dbErr?.message || dbErr}). Fallback to in-memory session.`);
+  if (mongoose.connection.readyState === 1) {
+    try {
+      const timeoutPromise = new Promise<any>((_, reject) =>
+        setTimeout(() => reject(new Error("MongoDB session create timeout")), 1500)
+      );
+      const doc = await Promise.race([
+        Module2Session.create({
+          user_id: userId,
+          session_type: sessionType,
+          index_symbol: indexSymbol,
+          expiry_date: expiryDate,
+          selected_strikes_json: selectedStrikes,
+          day_open_prices_json: dayOpenPrices,
+          futures_oi_json: futuresOI,
+          status: "ACTIVE",
+          started_at: new Date(),
+          stopped_at: null,
+          strike_start_boundaries: strikeStartBoundaries,
+        }),
+        timeoutPromise
+      ]);
+      sessionId = doc._id.toString();
+      createdAt = doc.created_at || new Date();
+    } catch (dbErr: any) {
+      console.warn(`[MODULE2-TRACKER] DB save warning (${dbErr?.message || dbErr}). Fallback to in-memory session.`);
+      sessionId = "mock-session-" + Date.now() + "-" + Math.random().toString(36).substring(2, 9);
+      createdAt = new Date();
+    }
+  } else {
     sessionId = "mock-session-" + Date.now() + "-" + Math.random().toString(36).substring(2, 9);
     createdAt = new Date();
   }
+
+  const elapsed = Date.now() - startTime;
+  console.log(`[MODULE2-TRACKER] startTrackerSession completed in ${elapsed}ms for userId=${userId} sessionId=${sessionId}`);
 
   const sessionData: Module2SessionData = {
     sessionId,
@@ -1061,7 +1127,9 @@ export const onLiveTickReceived = (symbol: string, ltp: number) => {
         strikeState.grid.push(currentCell);
       }
 
-      console.log(`[SOCKET][BROADCAST][TICK] session=${sessionId} symbol=${symbol} minute=${timeString} ltp=${ltp}`);
+      if (process.env.MODULE2_DEBUG_TICKS === "true") {
+        console.log(`[SOCKET][BROADCAST][TICK] session=${sessionId} symbol=${symbol} minute=${timeString} ltp=${ltp}`);
+      }
       broadcastTrackerUpdate(sessionId, {
         strike: symbol,
         cell: currentCell,

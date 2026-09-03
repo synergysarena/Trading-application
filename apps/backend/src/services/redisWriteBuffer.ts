@@ -129,6 +129,75 @@ export const readLive = async (key: string): Promise<string | null> => {
   return null;
 };
 
+/**
+ * Memory-first batch read for multiple live runtime keys.
+ * Hits mirror first for instant 0ms access.
+ * Any missing keys are queried concurrently in parallel with a bounded 2000ms timeout.
+ */
+export const readLiveBatch = async (keys: string[]): Promise<Map<string, string | null>> => {
+  const result = new Map<string, string | null>();
+  const missingKeys: string[] = [];
+  const now = Date.now();
+
+  for (const key of keys) {
+    const cached = mirror.get(key);
+    if (cached !== undefined) {
+      readMirrorHits++;
+      result.set(key, cached);
+      continue;
+    }
+    const absentTs = absentUntil.get(key);
+    if (absentTs !== undefined && now < absentTs) {
+      readMirrorHits++;
+      result.set(key, null);
+      continue;
+    }
+    missingKeys.push(key);
+  }
+
+  if (missingKeys.length === 0) {
+    return result;
+  }
+
+  readRedisFallbacks += missingKeys.length;
+
+  try {
+    const fetchPromises = missingKeys.map(async (key) => {
+      try {
+        const timeoutPromise = new Promise<null>((_, reject) =>
+          setTimeout(() => reject(new Error("Redis read timeout")), 2000)
+        );
+        const val = await Promise.race([redis.get(key), timeoutPromise]);
+        if (val != null) {
+          mirror.set(key, String(val));
+          result.set(key, String(val));
+        } else {
+          absentUntil.set(key, Date.now() + ABSENT_CACHE_MS);
+          result.set(key, null);
+        }
+      } catch {
+        absentUntil.set(key, Date.now() + ABSENT_CACHE_MS);
+        result.set(key, null);
+      }
+    });
+
+    await Promise.all(fetchPromises);
+  } catch (err: any) {
+    if (Date.now() - lastErrorLogTs > 10_000) {
+      console.warn(`[RedisBuffer] readLiveBatch failed (${err?.message || err}), using available mirror store`);
+      lastErrorLogTs = Date.now();
+    }
+  }
+
+  for (const key of keys) {
+    if (!result.has(key)) {
+      result.set(key, null);
+    }
+  }
+
+  return result;
+};
+
 export const getWriteBufferStats = () => ({
   commandsBuffered,
   commandsSent,

@@ -138,35 +138,28 @@ async function runTests() {
   }
 
   // ---------------------------------------------------------------------------
-  // TEST 7: Asynchronous Tracker Session Start (Non-blocking response)
+  // TEST 8: 20-Strike (10 CE + 10 PE) Performance & Batch Lookup
   // ---------------------------------------------------------------------------
-  console.log("\n[TEST 7] Asynchronous Tracker Session Start...");
-  const startTime = Date.now();
-  // Simulating startTrackerSession call
-  const sessionData = {
-    sessionId: "async-test-session",
-    userId: "test-user-async",
-    dataSource: "LIVE_MARKET_DATA_API" as const,
-    sessionType: "CE" as const,
-    indexSymbol: "NIFTY50",
-    expiryDate: "2026-09-03",
-    selectedStrikes: ["NIFTY24000CE"],
-    dayOpenPrices: {},
-    strikes: {} as any,
-    status: "ACTIVE" as const,
-    startedAt: new Date(),
-    stoppedAt: null,
-    strikeStartBoundaries: {},
-    createdAt: new Date(),
-  };
-  activeSessions[sessionData.sessionId] = sessionData;
-  // Fire subscription sync asynchronously without awaiting
-  syncAetramSubscriptions().catch(() => {});
-  const elapsed = Date.now() - startTime;
-  assert.strictEqual(elapsed < 100, true, "Session start response must be non-blocking (< 100ms)");
-  console.log(`✓ Session start executed in ${elapsed}ms (well below 10s frontend timeout).`);
+  console.log("\n[TEST 8] 20 Strikes (10 CE + 10 PE) Startup Performance...");
+  const ce20Strikes = Array.from({ length: 10 }, (_, i) => `NIFTY${24000 + i * 50}CE`);
+  const pe20Strikes = Array.from({ length: 10 }, (_, i) => `NIFTY${24000 + i * 50}PE`);
+  const all20Strikes = [...ce20Strikes, ...pe20Strikes];
+  assert.strictEqual(all20Strikes.length, 20, "Must have exactly 20 strikes for test");
 
-  delete activeSessions[sessionData.sessionId];
+  const start20Time = Date.now();
+  const session20 = await startTrackerSession(
+    "perf-test-user",
+    "mixed",
+    "NIFTY50",
+    "2026-09-03",
+    all20Strikes
+  );
+  const elapsed20 = Date.now() - start20Time;
+  assert.strictEqual(session20.selectedStrikes.length, 20, "Session must have all 20 strikes");
+  assert.strictEqual(elapsed20 < 3000, true, `20-strike start must complete in <3000ms (took ${elapsed20}ms)`);
+  console.log(`✓ 20 strikes initialized in ${elapsed20}ms (well below 10s/30s timeout).`);
+
+  delete activeSessions[session20.sessionId];
 
   console.log("\n========================================================");
   console.log("=== ALL REGRESSION TESTS PASSED SUCCESSFULLY (8/8)   ===");

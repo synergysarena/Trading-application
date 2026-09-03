@@ -531,11 +531,15 @@ marketDataEvents.on("LTP_UPDATED", (event: NormalizedMarketEvent) => {
 
   if (symbol) {
     bufferSet(`ltp:${symbol}`, String(event.lastPrice));
-    console.log(`[AETRAM][TICK] token=${rawId} symbol=${symbol} ltp=${event.lastPrice}`);
-    console.log(`[REDIS][LIVE] key=ltp:${symbol} value=${event.lastPrice}`);
+    if (process.env.MODULE2_DEBUG_TICKS === "true") {
+      console.log(`[AETRAM][TICK] token=${rawId} symbol=${symbol} ltp=${event.lastPrice}`);
+      console.log(`[REDIS][LIVE] key=ltp:${symbol} value=${event.lastPrice}`);
+    }
     onLiveTickReceived(symbol, event.lastPrice);
   } else {
-    console.log(`[AETRAM][TICK_UNMAPPED] token=${rawId} seg=${seg} ltp=${event.lastPrice}`);
+    if (process.env.MODULE2_DEBUG_TICKS === "true") {
+      console.log(`[AETRAM][TICK_UNMAPPED] token=${rawId} seg=${seg} ltp=${event.lastPrice}`);
+    }
   }
 });
 
@@ -551,7 +555,9 @@ marketDataEvents.on("OI_UPDATED", (event: NormalizedMarketEvent) => {
 
   if (symbol) {
     bufferSet(`oi:${symbol}`, String(event.openInterest));
-    console.log(`[REDIS][LIVE] key=oi:${symbol} value=${event.openInterest}`);
+    if (process.env.MODULE2_DEBUG_TICKS === "true") {
+      console.log(`[REDIS][LIVE] key=oi:${symbol} value=${event.openInterest}`);
+    }
   }
 });
 

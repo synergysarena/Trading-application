@@ -13,10 +13,7 @@ export default defineConfig({
     },
   },
   optimizeDeps: {
-    // Force Vite to pre-bundle this workspace package (CJS → ESM conversion).
-    // Without this, Vite serves the CommonJS dist directly to the browser,
-    // which fails because the browser can't handle require() calls.
-    include: ["@stock/shared"],
+    exclude: ["@stock/shared"],
   },
   server: {
     port: 3000,
