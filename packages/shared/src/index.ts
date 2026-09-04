@@ -20,6 +20,7 @@ export interface Candle {
   close: number;
   openTime: number;
   volume: number;
+  isSynthetic?: boolean;
 }
 
 export interface PivotLevels {

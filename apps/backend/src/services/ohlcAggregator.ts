@@ -2,11 +2,23 @@ import { FuturesOHLC } from "../models/FuturesOHLC";
 import { Tick, Candle } from "@stock/shared";
 import { readLive } from "./redisWriteBuffer";
 import { archiveModule1Candles } from "./module1ArchiveService";
-
 import { isMarketDataProcessingEnabled } from "./marketDataLifecycle";
 
-// Local cache for active candles: activeCandles[symbol][timeframe]
+// Symbols that require continuous minute timeline (synthetic carry-forward when no tick arrives)
+// Option contracts are strictly tick-based and NOT synthesized automatically.
+const CONTINUOUS_SYMBOLS = new Set(["NIFTY-SPOT", "NIFTY-FUT"]);
+
+// Standard timeframes tracked for proactive continuity
+const CONTINUITY_TIMEFRAMES = ["1m", "2m", "3m", "5m", "10m", "15m", "30m", "45m", "1h", "2h", "3h", "4h"];
+
+// Local cache for active in-progress candles: activeCandles[symbol][timeframe]
 const activeCandles: Record<string, Record<string, Candle>> = {};
+
+// Local cache for finalized candles: finalizedCandlesCache[symbol][timeframe]
+const finalizedCandlesCache: Record<string, Record<string, Candle[]>> = {};
+
+// Last known close price per symbol and timeframe (used for carry-forward open/close)
+const lastKnownClose: Record<string, Record<string, number>> = {};
 
 let boundaryInterval: NodeJS.Timeout | null = null;
 
@@ -45,6 +57,9 @@ export const startBoundaryChecker = () => {
   boundaryInterval = setInterval(async () => {
     if (!isMarketDataProcessingEnabled()) return;
     const now = Date.now();
+    const sessionOpenMs = getTodaySessionOpenMs();
+
+    // 1. Proactive finalization for active candles that have crossed their boundary
     for (const symbol of Object.keys(activeCandles)) {
       for (const tfStr of Object.keys(activeCandles[symbol])) {
         if (!isMarketDataProcessingEnabled()) return;
@@ -55,20 +70,64 @@ export const startBoundaryChecker = () => {
         if (!isMarketDataProcessingEnabled()) return;
 
         // Re-check identity after the await: a tick may have finalized and
-        // replaced this candle while getTimeframeMinutes yielded. Without this
-        // check the same candle gets finalized twice and the freshly opened
-        // replacement candle is deleted (boundary double-finalize race).
+        // replaced this candle while getTimeframeMinutes yielded.
         if (activeCandles[symbol]?.[tfStr] !== candle) continue;
 
         const nextBoundary = candle.openTime + tfMins * 60000;
 
         if (now >= nextBoundary) {
           if (!isMarketDataProcessingEnabled()) return;
-          console.log(`[OHLC] Proactive finalization for ${symbol} (${tfStr}) on boundary.`);
+          console.log(`[MODULE1][BOUNDARY] Proactive finalization for ${symbol} (${tfStr}) at ${new Date(candle.openTime).toISOString()}.`);
           const candleToFinalize = candle;
           delete activeCandles[symbol][tfStr];
+          if (!lastKnownClose[symbol]) lastKnownClose[symbol] = {};
+          lastKnownClose[symbol][tfStr] = candleToFinalize.close;
           await finaliseCandle(candleToFinalize);
         }
+      }
+    }
+
+    // 2. Continuity check for NIFTY-SPOT and NIFTY-FUT:
+    // If a minute has elapsed with NO ticks received, create a synthetic carry-forward candle.
+    for (const symbol of CONTINUOUS_SYMBOLS) {
+      if (!isMarketDataProcessingEnabled()) return;
+      for (const tfStr of CONTINUITY_TIMEFRAMES) {
+        const prevClose = lastKnownClose[symbol]?.[tfStr];
+        if (prevClose === undefined || prevClose <= 0) continue;
+
+        const tfMins = await getTimeframeMinutes(tfStr);
+        if (!isMarketDataProcessingEnabled()) return;
+
+        const currentBoundary = getBoundaryTime(new Date(now), tfMins);
+        const prevBoundary = currentBoundary - tfMins * 60000;
+
+        // Only create carry-forward bars within the current trading session
+        if (prevBoundary < sessionOpenMs) continue;
+
+        // Check if an active candle exists for prevBoundary or currentBoundary
+        const active = activeCandles[symbol]?.[tfStr];
+        if (active && active.openTime >= prevBoundary) continue;
+
+        // Check if a finalized candle already exists for prevBoundary
+        const cachedList = finalizedCandlesCache[symbol]?.[tfStr] || [];
+        const hasFinalized = cachedList.some(c => c.openTime === prevBoundary);
+        if (hasFinalized) continue;
+
+        // No active candle and no finalized candle for prevBoundary -> generate synthetic carry-forward candle
+        const syntheticCandle: Candle = {
+          symbol,
+          timeframe: tfStr,
+          open: prevClose,
+          high: prevClose,
+          low: prevClose,
+          close: prevClose,
+          openTime: prevBoundary,
+          volume: 0,
+          isSynthetic: true,
+        };
+
+        console.log(`[MODULE1][BOUNDARY] Generated synthetic carry-forward candle for ${symbol} (${tfStr}) at ${new Date(prevBoundary).toISOString()} (close=${prevClose}).`);
+        await finaliseCandle(syntheticCandle);
       }
     }
   }, 1000);
@@ -146,7 +205,8 @@ let diagOhlc1mCount = 0;
 const MAX_DIAG_OHLC = 20;
 
 /**
- * Aggregates a raw tick into the corresponding timeframe candles for that symbol
+ * Aggregates a raw tick into the corresponding timeframe candles for that symbol.
+ * Enforces strict timestamp-boundary matching.
  */
 export const aggregateOHLC = async (tick: Tick, timeframeMinutes: number, timeframeStr: string): Promise<Candle> => {
   if (!isMarketDataProcessingEnabled()) {
@@ -159,6 +219,7 @@ export const aggregateOHLC = async (tick: Tick, timeframeMinutes: number, timefr
       close: tick.ltp,
       openTime: getBoundaryTime(tick.timestamp, timeframeMinutes),
       volume: tick.volume || 0,
+      isSynthetic: false,
     };
   }
   const { symbol, ltp, timestamp, volume = 0 } = tick;
@@ -166,37 +227,81 @@ export const aggregateOHLC = async (tick: Tick, timeframeMinutes: number, timefr
   if (!activeCandles[symbol]) {
     activeCandles[symbol] = {};
   }
+  if (!lastKnownClose[symbol]) {
+    lastKnownClose[symbol] = {};
+  }
+  lastKnownClose[symbol][timeframeStr] = ltp;
 
   const boundary = getBoundaryTime(timestamp, timeframeMinutes);
   let candle = activeCandles[symbol][timeframeStr];
 
+  // Check if a synthetic candle was previously finalized for this boundary
+  const cachedList = finalizedCandlesCache[symbol]?.[timeframeStr] || [];
+  const syntheticIdx = cachedList.findIndex(c => c.openTime === boundary && c.isSynthetic);
+
   if (!candle || candle.openTime < boundary) {
-    // If there is an existing active candle, it has crossed the timeframe boundary, so finalize it.
+    // If there is an existing active candle, finalize it first
     if (candle) {
       await finaliseCandle(candle);
     }
 
-    // Initialize brand new candle
-    candle = {
-      symbol,
-      timeframe: timeframeStr,
-      open: ltp,
-      high: ltp,
-      low: ltp,
-      close: ltp,
-      openTime: boundary,
-      volume,
-    };
+    if (syntheticIdx >= 0) {
+      // A synthetic candle was previously finalized for this exact boundary — overwrite it with real tick data
+      const syn = cachedList[syntheticIdx];
+      syn.open = ltp;
+      syn.high = ltp;
+      syn.low = ltp;
+      syn.close = ltp;
+      syn.volume = volume;
+      syn.isSynthetic = false;
+      console.log(`[MODULE1][AGGREGATOR] Real tick arrived for synthetic candle ${symbol} (${timeframeStr}) at ${new Date(boundary).toISOString()} — replaced synthetic bar.`);
+      persistQueue.push({ ...syn });
+      void drainPersistQueue();
+      candle = syn;
+    } else {
+      // Initialize brand new real candle
+      candle = {
+        symbol,
+        timeframe: timeframeStr,
+        open: ltp,
+        high: ltp,
+        low: ltp,
+        close: ltp,
+        openTime: boundary,
+        volume,
+        isSynthetic: false,
+      };
+    }
   } else if (candle.openTime === boundary) {
     // Update existing active candle in the current boundary interval
     candle.high = Math.max(candle.high, ltp);
     candle.low = Math.min(candle.low, ltp);
     candle.close = ltp;
     candle.volume += volume;
+    candle.isSynthetic = false;
+    if (syntheticIdx >= 0) {
+      cachedList[syntheticIdx] = { ...candle };
+    }
   } else {
     // Out-of-order or late tick (boundary < candle.openTime):
-    // Do NOT corrupt the current in-progress candle with historical tick data.
-    console.warn(`[OHLC] Late/out-of-order tick for ${symbol} (${timeframeStr}): tickTime=${timestamp.toISOString()} boundary=${new Date(boundary).toISOString()} currentCandle=${new Date(candle.openTime).toISOString()}`);
+    // Check if a synthetic candle was finalized for this exact boundary.
+    // If so, replace/update that synthetic candle with real tick data without corrupting active candle.
+    if (syntheticIdx >= 0) {
+      const syn = cachedList[syntheticIdx];
+      syn.open = ltp;
+      syn.high = ltp;
+      syn.low = ltp;
+      syn.close = ltp;
+      syn.volume = volume;
+      syn.isSynthetic = false;
+      console.log(`[MODULE1][AGGREGATOR] Late real tick arrived for synthetic candle ${symbol} (${timeframeStr}) at ${new Date(boundary).toISOString()} — replaced synthetic bar.`);
+      persistQueue.push({ ...syn });
+      void drainPersistQueue();
+      return syn;
+    }
+
+    // Otherwise, this is a late tick for an already finalized real candle — do not corrupt current candle
+    console.warn(`[MODULE1][AGGREGATOR] Late/out-of-order tick for ${symbol} (${timeframeStr}): tickTime=${timestamp.toISOString()} boundary=${new Date(boundary).toISOString()} currentCandle=${new Date(candle.openTime).toISOString()}`);
     return candle;
   }
 
@@ -206,7 +311,7 @@ export const aggregateOHLC = async (tick: Tick, timeframeMinutes: number, timefr
   if (timeframeStr === "1m" && (symbol === "NIFTY-FUT" || symbol === "NIFTY-SPOT") && diagOhlc1mCount < MAX_DIAG_OHLC) {
     diagOhlc1mCount++;
     console.log(
-      `[OHLC DEBUG][1m #${diagOhlc1mCount}] symbol=${symbol} min=${new Date(boundary).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: false })} ` +
+      `[MODULE1][TICK][1m #${diagOhlc1mCount}] symbol=${symbol} min=${new Date(boundary).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: false })} ` +
       `tick=${ltp} -> O=${candle.open} H=${candle.high} L=${candle.low} C=${candle.close} vol=${candle.volume}`
     );
   }
@@ -214,42 +319,27 @@ export const aggregateOHLC = async (tick: Tick, timeframeMinutes: number, timefr
   return candle;
 };
 
-const finalizedCandlesCache: Record<string, Record<string, Candle[]>> = {};
-
 // ── Phase 6: persistence moved off the tick hot path ─────────────────────────
-//
-// finaliseCandle used to await a Mongo upsert + deleteMany per candle, inside
-// the tick-processing chain. At each 1m boundary that meant a burst of hundreds
-// of concurrent Mongo ops (84 symbols × upsert + prune + 3 pivot inserts) racing
-// with the Upstash flood — see PHASE5_VALIDATION_REPORT.md §9. Candles are now
-// queued and drained by a single serialized worker: one bulkWrite per drain,
-// session pruning at most once per (symbol,timeframe) per session, and the
-// pivot callback still fires once per finalized candle (serially, so Mongo
-// concurrency stays bounded). Bar values and finalize triggers are unchanged.
-
 const persistQueue: Candle[] = [];
 let draining = false;
-// Tracks the session-open ms already pruned per "symbol|timeframe" so the
-// deleteMany cleanup runs once per pair per session instead of per candle.
 const prunedSessions = new Map<string, number>();
-// Rolling retention window for the prune below — matches the 24-hour TTL index in
-// FuturesOHLCSchema.ts (86,400 seconds). Kept as an explicit deleteMany (rather than
-// relying on the TTL alone) so the collection stays bounded even if the TTL
-// background task lags.
 const HISTORY_RETENTION_MS = 24 * 60 * 60 * 1000;
 
 let _persistErrCount = 0;
 let _persistErrLastLog = 0;
 
-// Single source of truth for the candle upsert op — the initial bulk write and
-// the duplicate-key retry must persist the exact same doc for the same filter.
+// Single source of truth for the candle upsert op — includes is_synthetic
 const candleToUpsertOp = (c: Candle) => ({
   updateOne: {
     filter: { symbol: c.symbol, timeframe: c.timeframe, bar_time: new Date(c.openTime) },
     update: {
       $set: {
-        bar_open: c.open, bar_high: c.high, bar_low: c.low,
-        bar_close: c.close, volume: c.volume,
+        bar_open: c.open,
+        bar_high: c.high,
+        bar_low: c.low,
+        bar_close: c.close,
+        volume: c.volume,
+        is_synthetic: !!c.isSynthetic,
       },
     },
     upsert: true,
@@ -276,22 +366,20 @@ const drainPersistQueue = async () => {
       }
       const batch = persistQueue.splice(0, persistQueue.length);
 
-      // Async fire-and-forget archival to Module1CandleArchive
-      void archiveModule1Candles(batch).catch(() => {});
+      // Async fire-and-forget archival to Module1CandleArchive (real candles only)
+      const realBatch = batch.filter(c => !c.isSynthetic);
+      if (realBatch.length > 0) {
+        void archiveModule1Candles(realBatch).catch(() => {});
+      }
 
-      // 1. One bulk upsert for the whole batch (same doc shape/filter as the
-      //    previous per-candle findOneAndUpdate upsert).
+      // 1. One bulk upsert for the whole batch
       try {
         if (!isMarketDataProcessingEnabled()) break;
         await FuturesOHLC.bulkWrite(batch.map(candleToUpsertOp), { ordered: false });
-        console.log(`[OHLC] Persisted ${batch.length} finalized candle(s) in one bulk write.`);
+        console.log(`[MODULE1][PERSIST] Persisted ${batch.length} finalized candle(s) in one bulk write.`);
       } catch (error: any) {
         if (!isMarketDataProcessingEnabled()) break;
-        // E11000 duplicate key: two upserts raced on the same (symbol,
-        // timeframe, bar_time) key and the unique index rejected the loser.
-        // The doc now exists, so re-running the identical op is a plain
-        // update — retry only the duplicate-key ops (unordered bulkWrite
-        // already applied every non-failing op).
+        // E11000 duplicate key: retry duplicate-key ops
         const writeErrors: any[] = error?.writeErrors ?? [];
         const dupes = writeErrors.filter((we: any) => we?.code === 11000);
         let recovered = false;
@@ -301,23 +389,21 @@ const drainPersistQueue = async () => {
               dupes.map((we: any) => candleToUpsertOp(batch[we.index])),
               { ordered: false }
             );
-            console.log(`[OHLC] Re-applied ${dupes.length} candle upsert(s) after duplicate-key race.`);
+            console.log(`[MODULE1][PERSIST] Re-applied ${dupes.length} candle upsert(s) after duplicate-key race.`);
             recovered = true;
-          } catch { /* fall through to the failure counter below */ }
+          } catch { /* fall through to failure logging */ }
         }
         if (!recovered) {
           _persistErrCount++;
           const now = Date.now();
-          if (now - _persistErrLastLog > 30_000) {
+          if (now - _persistErrLastLog > 10_000) {
             _persistErrLastLog = now;
-            console.error(`[OHLC] Bulk persist failed (${_persistErrCount} failure(s) so far, in-memory cache unaffected): ${error?.message || error}`);
+            console.error(`[MODULE1][PERSIST][ERROR] Bulk persist failed (${_persistErrCount} failure(s) so far): ${error?.message || error}`);
           }
         }
       }
 
-      // 2. Retention pruning — once per (symbol,timeframe) per session day.
-      // Cutoff is a rolling 45-day window (matches the TTL index), not
-      // "today's session open" — see HISTORY_RETENTION_MS above.
+      // 2. Retention pruning — once per (symbol,timeframe) per session day
       for (const c of batch) {
         if (!isMarketDataProcessingEnabled()) break;
         const key = `${c.symbol}|${c.timeframe}`;
@@ -330,22 +416,23 @@ const drainPersistQueue = async () => {
             timeframe: c.timeframe,
             bar_time: { $lt: new Date(Date.now() - HISTORY_RETENTION_MS) },
           });
-        } catch { /* retried next session; cache-side filtering already excludes old bars */ }
+        } catch { /* retried next session */ }
       }
 
-      // 3. Pivot recalculation per finalized candle — unchanged semantics,
-      //    now serialized so Mongo insert concurrency stays bounded.
+      // 3. Pivot recalculation per finalized candle (real candles only)
       if (onCandleFinalized && isMarketDataProcessingEnabled()) {
         for (const c of batch) {
           if (!isMarketDataProcessingEnabled()) break;
+          // Only recalculate pivots on real traded bars
+          if (c.isSynthetic) continue;
           try {
             await onCandleFinalized(c);
           } catch (err: any) {
             _persistErrCount++;
             const now = Date.now();
-            if (now - _persistErrLastLog > 30_000) {
+            if (now - _persistErrLastLog > 10_000) {
               _persistErrLastLog = now;
-              console.error(`[OHLC] onCandleFinalized failed (${_persistErrCount} failure(s) so far): ${err?.message || err}`);
+              console.error(`[MODULE1][PERSIST][ERROR] onCandleFinalized failed (${_persistErrCount} failure(s)): ${err?.message || err}`);
             }
           }
         }
@@ -362,8 +449,6 @@ const drainPersistQueue = async () => {
  */
 const finaliseCandle = async (liveCandle: Candle) => {
   if (!isMarketDataProcessingEnabled()) return;
-  // Snapshot: the live object could still be mutated by a racing tick between
-  // queueing and the background bulk write — cache and persist frozen values.
   const candle: Candle = { ...liveCandle };
   const { symbol, timeframe } = candle;
   if (!finalizedCandlesCache[symbol]) finalizedCandlesCache[symbol] = {};
@@ -371,6 +456,7 @@ const finaliseCandle = async (liveCandle: Candle) => {
 
   const existingIdx = finalizedCandlesCache[symbol][timeframe].findIndex(c => c.openTime === candle.openTime);
   if (existingIdx >= 0) {
+    // If updating an existing synthetic candle with real candle or newer values, update it
     finalizedCandlesCache[symbol][timeframe][existingIdx] = candle;
   } else {
     finalizedCandlesCache[symbol][timeframe].push(candle);
@@ -381,7 +467,6 @@ const finaliseCandle = async (liveCandle: Candle) => {
   }
 
   persistQueue.push(candle);
-  // Fire-and-forget: the worker single-flights, so concurrent calls coalesce.
   void drainPersistQueue();
 };
 

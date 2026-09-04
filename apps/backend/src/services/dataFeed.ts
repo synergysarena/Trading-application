@@ -8,9 +8,10 @@ import redis from "../config/redis";
 import {
   startZebuMarketDataFeedWithCredentials, setRuntimeInstrumentTokens,
   parseInstrumentEnv, ZebuInstrument, isZebuLiveConnected,
+  clearDynamicSubscribedInstruments,
 } from "./zebuMarketDataClient";
 import { broadcastBrokerStatus, resetMarketReady } from "./socketService";
-import { refreshInstrumentTokens, recomputeOptionBandFromLivePrice } from "./instrumentTokenService";
+import { getActiveInstrumentTokens, refreshInstrumentTokens, recomputeOptionBandFromLivePrice } from "./instrumentTokenService";
 
 let zebuClient: { close: () => void; subscribeTokens?: (instruments: ZebuInstrument[]) => void } | null = null;
 
@@ -191,9 +192,9 @@ export const startDataFeedWithCredentials = async (userId: string, sessionToken:
     atmIsReliableAtConnect = true;
     atmBandRecomputed = false;
 
-    // Always refresh instrument tokens before connecting (handles weekly/monthly expiry)
-    console.log("[DataFeed] Refreshing instrument tokens from NFO master...");
-    const freshTokens = await refreshInstrumentTokens().catch(() => null);
+    // Load active instrument tokens (uses 4-hour cache during reconnects; downloads only if expired/empty)
+    console.log("[DataFeed] Loading active instrument tokens...");
+    const freshTokens = await getActiveInstrumentTokens().catch(() => null);
     if (freshTokens) {
       setRuntimeInstrumentTokens(freshTokens.futToken, freshTokens.ceTokens, freshTokens.peTokens);
       // Purge any stale in-memory OI from warmup (may reference expired contracts whose
@@ -203,9 +204,9 @@ export const startDataFeedWithCredentials = async (userId: string, sessionToken:
       if (!atmIsReliableAtConnect) {
         console.warn("[DataFeed] ATM band was seeded from a stale fallback at connect time — will recompute from the first real spot/futures tick.");
       }
-      console.log(`[DataFeed] Tokens refreshed — futures expiry: ${freshTokens.futExpiry} | option expiry: ${freshTokens.nearestOptionExpiry}`);
+      console.log(`[DataFeed] Tokens loaded — futures expiry: ${freshTokens.futExpiry} | option expiry: ${freshTokens.nearestOptionExpiry}`);
     } else {
-      console.warn("[DataFeed] NFO token refresh failed — using .env tokens (check network / NFO URL).");
+      console.warn("[DataFeed] NFO token loading failed — using .env tokens (check network / NFO URL).");
     }
 
     console.log(`[DataFeed] Starting live feed for user: ${userId}`);
@@ -250,6 +251,7 @@ export const stopDataFeed = (_force = false) => {
   storedSessionToken = null;
   sessionExpired = false;
   reconnectAttempts = 0;
+  clearDynamicSubscribedInstruments();
   if (zebuClient) {
     try { zebuClient.close(); } catch {}
     zebuClient = null;

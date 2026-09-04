@@ -10,6 +10,7 @@ export interface OHLCBar {
   // premiums and the Spot index either lack it or aren't sourced here).
   // Undefined means "no volume data for this bar", not zero.
   volume?: number;
+  isSynthetic?: boolean;
 }
 
 export interface PivotLevels {

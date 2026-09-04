@@ -38,6 +38,10 @@ export const FuturesOHLCSchema = new Schema({
     type: Number,
     default: 0,
   },
+  is_synthetic: {
+    type: Boolean,
+    default: false,
+  },
 });
 
 // One candle per (symbol, timeframe, bar_time) — enforced at the DB level so

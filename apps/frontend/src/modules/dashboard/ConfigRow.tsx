@@ -4,13 +4,40 @@ import { useDashStore } from "./store";
 import { useStore } from "../../store/useStore";
 import { fetchExchanges, fetchInstrumentTypes, fetchSymbols, fetchSymbolExpiries, fetchStrikes } from "../../data/liveApi";
 import { formatExpiryDisplay } from "../../data/models";
+import { api } from "../../utils/api";
 
 // ── Live price hook ───────────────────────────────────────────────────────────
 
 function useLivePrice(symbol: string): { ltp: number | null; dir: "up" | "down" | null } {
   const ltp = useStore((s) => s.prices[symbol]?.ltp ?? null);
+  const updatePrice = useStore((s) => s.updatePrice);
   const prevRef = useRef<number | null>(null);
   const [dir, setDir] = useState<"up" | "down" | null>(null);
+
+  // Initial fetch for Spot / Future price if not yet cached in store
+  useEffect(() => {
+    if (ltp !== null) return;
+    let cancelled = false;
+    const fetchInitial = async () => {
+      try {
+        const res = await api.get(`/api/market/spot/${symbol}`);
+        if (!cancelled && typeof res?.ltp === "number" && res.ltp > 0) {
+          updatePrice(symbol, res.ltp);
+        }
+      } catch {
+        if (symbol.includes("FUT")) {
+          try {
+            const futRes = await api.get(`/api/market/futures/${symbol}`);
+            if (!cancelled && typeof futRes?.ltp === "number" && futRes.ltp > 0) {
+              updatePrice(symbol, futRes.ltp);
+            }
+          } catch {}
+        }
+      }
+    };
+    fetchInitial();
+    return () => { cancelled = true; };
+  }, [symbol, ltp, updatePrice]);
 
   useEffect(() => {
     if (ltp === null) return;

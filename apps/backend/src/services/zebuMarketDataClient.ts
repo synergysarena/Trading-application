@@ -303,6 +303,14 @@ const isSessionExpiredMessage = (emsg?: string, stat?: string): boolean => {
   return SESSION_EXPIRY_PATTERNS.some(p => combined.includes(p));
 };
 
+// Dynamic runtime subscriptions (e.g. option strikes requested by user)
+// Preserved across WebSocket reconnect cycles so reconnected feed immediately resubscribes them.
+const dynamicSubscribedInstruments = new Map<string, ZebuInstrument>();
+
+export const clearDynamicSubscribedInstruments = () => {
+  dynamicSubscribedInstruments.clear();
+};
+
 export const startZebuMarketDataFeedWithCredentials = (
   userId: string,
   sessionToken: string,
@@ -313,8 +321,14 @@ export const startZebuMarketDataFeedWithCredentials = (
   onConnected?: () => void,
 ): ZebuClient => {
   const wsUrl = getZebuWsUrl();
-  const instruments   = getModule1ZebuInstruments();
-  const symbolByKey   = buildInstrumentMap(instruments);
+  const baseInstruments = getModule1ZebuInstruments();
+  const extraInstruments = Array.from(dynamicSubscribedInstruments.values());
+  const allInstrumentsMap = new Map<string, ZebuInstrument>();
+  for (const inst of [...baseInstruments, ...extraInstruments]) {
+    allInstrumentsMap.set(inst.key, inst);
+  }
+  const instruments = Array.from(allInstrumentsMap.values());
+  const symbolByKey = buildInstrumentMap(instruments);
   const subscribeKeys = instruments.map((i) => i.key).join("#");
 
   if (!wsUrl || !/^wss?:\/\//.test(wsUrl)) {
@@ -349,6 +363,7 @@ export const startZebuMarketDataFeedWithCredentials = (
 
     for (const inst of fresh) {
       subscribedKeys.add(inst.key);
+      dynamicSubscribedInstruments.set(inst.key, inst);
       symbolByKey.set(inst.key, inst.symbol);
       symbolByKey.set(inst.token, inst.symbol);
     }

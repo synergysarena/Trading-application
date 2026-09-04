@@ -167,6 +167,7 @@ export const getOHLCBars = async (req: AuthenticatedRequest, res: Response) => {
     symbol: string; timeframe: string;
     open: number; high: number; low: number; close: number;
     openTime: number; volume: number;
+    isSynthetic?: boolean;
   };
 
   let bars: OhlcBar[] = [];
@@ -199,7 +200,8 @@ export const getOHLCBars = async (req: AuthenticatedRequest, res: Response) => {
       low: b.bar_low,
       close: b.bar_close,
       openTime: new Date(b.bar_time).getTime(),
-      volume: b.volume
+      volume: b.volume,
+      isSynthetic: (b as any).is_synthetic ?? false,
     }));
   } catch (error) {
     console.error("[OHLC] MongoDB error, trying in-memory finalized cache:", error);
@@ -223,6 +225,7 @@ export const getOHLCBars = async (req: AuthenticatedRequest, res: Response) => {
           close: b.bar_close,
           openTime: new Date(b.bar_time).getTime(),
           volume: b.volume ?? 0,
+          isSynthetic: false,
         }));
       }
     } catch (archiveErr) {
@@ -340,6 +343,7 @@ export const getHistoricalOHLCBars = async (req: AuthenticatedRequest, res: Resp
       close:    b.bar_close,
       openTime: new Date(b.bar_time).getTime(),
       volume:   b.volume,
+      isSynthetic: (b as any).is_synthetic ?? false,
     }));
 
     return res.status(200).json(bars);

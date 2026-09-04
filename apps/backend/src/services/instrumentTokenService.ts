@@ -261,18 +261,28 @@ const buildActiveTokens = (rows: MasterRow[], atmStrike: number, atmIsReliable: 
 
 /**
  * Downloads the NFO instrument master (see MASTER_URLS), caches it, and refreshes
- * the NIFTY live-subscription token list from it. Called before each broker
- * connection attempt to stay current across expiries.
+ * the NIFTY live-subscription token list from it.
+ * Uses cached tokens if still valid (< CACHE_TTL_MS) unless `force: true` is passed.
  */
-export const refreshInstrumentTokens = async (): Promise<ActiveInstrumentTokens | null> => {
+export const refreshInstrumentTokens = async (options?: { force?: boolean }): Promise<ActiveInstrumentTokens | null> => {
+  const force = options?.force ?? false;
+  if (!force && cachedTokens && cachedRows.length > 0 && Date.now() - lastFetchTime < CACHE_TTL_MS) {
+    console.log(`[MODULE1][RECONNECT] Reusing cached instrument tokens (age: ${Math.round((Date.now() - lastFetchTime) / 1000)}s, rows: ${cachedRows.length}).`);
+    return cachedTokens;
+  }
+
   try {
-    console.log(`[InstrumentTokens] Downloading NFO instrument master ...`);
+    console.log(`[InstrumentTokens] Downloading NFO instrument master (force=${force}) ...`);
     const perExchangeRows = await Promise.all(
       Object.entries(MASTER_URLS).map(([code, url]) => downloadAndParseMaster(code, url))
     );
     const rows = perExchangeRows.flat();
 
     if (rows.length === 0) {
+      if (cachedTokens) {
+        console.warn("[InstrumentTokens] Download failed or empty — falling back to previously cached tokens.");
+        return cachedTokens;
+      }
       console.warn("[InstrumentTokens] No rows parsed from the NFO master — cannot proceed.");
       return null;
     }
@@ -331,6 +341,10 @@ export const refreshInstrumentTokens = async (): Promise<ActiveInstrumentTokens 
     return tokens;
   } catch (err: any) {
     console.error("[InstrumentTokens] Refresh failed:", err?.message || err);
+    if (cachedTokens) {
+      console.warn("[InstrumentTokens] Using stale cached tokens due to refresh error.");
+      return cachedTokens;
+    }
     return null;
   }
 };
@@ -338,9 +352,10 @@ export const refreshInstrumentTokens = async (): Promise<ActiveInstrumentTokens 
 /**
  * Returns cached tokens if fresh, otherwise triggers a refresh.
  */
-export const getActiveInstrumentTokens = async (): Promise<ActiveInstrumentTokens | null> => {
-  if (cachedTokens && Date.now() - lastFetchTime < CACHE_TTL_MS) return cachedTokens;
-  return refreshInstrumentTokens();
+export const getActiveInstrumentTokens = async (options?: { force?: boolean }): Promise<ActiveInstrumentTokens | null> => {
+  const force = options?.force ?? false;
+  if (!force && cachedTokens && cachedRows.length > 0 && Date.now() - lastFetchTime < CACHE_TTL_MS) return cachedTokens;
+  return refreshInstrumentTokens(options);
 };
 
 export const getCachedInstrumentTokens = (): ActiveInstrumentTokens | null => cachedTokens;

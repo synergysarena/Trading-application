@@ -6,6 +6,7 @@ import { Tick, PivotLevels } from "@stock/shared";
 import { getLatestModule1OiMetrics } from "./module1OiService";
 import { isZebuLiveConnected } from "./zebuMarketDataClient";
 import { resolveOptionInstrument } from "./instrumentTokenService";
+import { readLive } from "./redisWriteBuffer";
 import {
   registerModule1Session,
   removeModule1SessionBySocket,
@@ -77,11 +78,36 @@ export const initSocketServer = (io: Server) => {
       console.log(`[Socket] Sent market_ready replay to ${socket.id} — ltp=${_marketReadyLtp}`);
     }
 
+    // Immediately replay latest known price ticks for core symbols (NIFTY-SPOT, NIFTY-FUT)
+    // so the frontend doesn't sit with empty "—" Spot/Future prices on initial load.
+    for (const sym of ["NIFTY-SPOT", "NIFTY-FUT"]) {
+      readLive(`ltp:${sym}`).then((val) => {
+        if (val) {
+          const ltp = parseFloat(val);
+          if (!isNaN(ltp) && ltp > 0) {
+            socket.emit("tick", { symbol: sym, ltp, timestamp: new Date().toISOString() });
+            console.log(`[Socket] Replayed initial tick to ${socket.id} — symbol=${sym} ltp=${ltp}`);
+          }
+        }
+      }).catch(() => {});
+    }
+
     // 1. Join room to receive raw price ticks for a specific symbol
-    socket.on("join:symbol", (symbol: string) => {
+    socket.on("join:symbol", async (symbol: string) => {
       touchModule1Session(socket.id);
       socket.join(`market:${symbol}`);
       console.log(`[Socket] Client ${socket.id} subscribed to market ticks: ${symbol}`);
+
+      // Immediately replay latest known price tick for this symbol to the subscribing client
+      try {
+        const val = await readLive(`ltp:${symbol}`);
+        if (val) {
+          const ltp = parseFloat(val);
+          if (!isNaN(ltp) && ltp > 0) {
+            socket.emit("tick", { symbol, ltp, timestamp: new Date().toISOString() });
+          }
+        }
+      } catch {}
     });
 
     socket.on("leave:symbol", (symbol: string) => {

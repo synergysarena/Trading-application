@@ -44,7 +44,8 @@ function normalizeBar(raw: any): OHLCBar | null {
       !Number.isFinite(+l) || !Number.isFinite(+c)) return null;
   const rawVolume = raw.volume ?? raw.v;
   const volume = rawVolume != null && Number.isFinite(+rawVolume) ? +rawVolume : undefined;
-  return { t, o: +o, h: +h, l: +l, c: +c, volume };
+  const isSynthetic = !!(raw.isSynthetic ?? raw.is_synthetic);
+  return { t, o: +o, h: +h, l: +l, c: +c, volume, isSynthetic };
 }
 
 interface ActiveBar {
@@ -523,10 +524,12 @@ export function Dashboard() {
           const last        = closedBars[closedBars.length - 1];
           const lastSpotBar = spotMap.get(last.t) ?? last;
           setLivePrices(lastSpotBar.c, last.c);
+          useStore.getState().updatePrice("NIFTY-SPOT", lastSpotBar.c);
+          useStore.getState().updatePrice("NIFTY-FUT", last.c);
 
           console.log(
             `[Module1/Data] History loaded: ${closedBars.length} closed bars | ` +
-            `sessionHigh=${sessionHigh} sessionLow=${sessionLow} | last bar t=${last.t}`
+            `sessionHigh=${sessionHigh} sessionLow=${sessionLow} | last bar t=${last.t} | spot=${lastSpotBar.c} fut=${last.c}`
           );
         }
 
@@ -593,16 +596,14 @@ export function Dashboard() {
       const now         = Date.now();
       const windowStart = Math.floor(now / tfMs) * tfMs;
 
-      const futLtp  = prices["NIFTY-FUT"]?.ltp;
-      const spotLtp = prices["NIFTY-SPOT"]?.ltp;
+      const futLtp  = prices["NIFTY-FUT"]?.ltp ?? dash.futureLtp;
+      const spotLtp = prices["NIFTY-SPOT"]?.ltp ?? dash.spotLtp;
 
       if (!futLtp) return;
 
-      const FRESH_TTL_MS = 8000;
+      const FRESH_TTL_MS = 15000;
       const futUpdatedAt  = prices["NIFTY-FUT"]?.lastUpdated?.getTime();
-      const futFresh      = futUpdatedAt  !== undefined && (now - futUpdatedAt)  < FRESH_TTL_MS;
-      const spotUpdatedAt = prices["NIFTY-SPOT"]?.lastUpdated?.getTime();
-      const spotFresh     = spotUpdatedAt !== undefined && (now - spotUpdatedAt) < FRESH_TTL_MS;
+      const futFresh      = futLtp != null && (futUpdatedAt === undefined || (now - futUpdatedAt) < FRESH_TTL_MS);
 
       const { expiryDate: expDate, instrument: inst, callStrike: cs, putStrike: ps, type: t } =
         useDashStore.getState();
@@ -679,8 +680,8 @@ export function Dashboard() {
 
         const callBar: OHLCBar = (ceFresh && !isNaN(ceN)) ? { t: windowStart, o: ceN, h: ceN, l: ceN, c: ceN } : MISSING_BAR(windowStart);
         const putBar:  OHLCBar = (peFresh && !isNaN(peN)) ? { t: windowStart, o: peN, h: peN, l: peN, c: peN } : MISSING_BAR(windowStart);
-        const futBar:  OHLCBar = futFresh  ? { t: windowStart, o: futLtp, h: futLtp, l: futLtp, c: futLtp } : MISSING_BAR(windowStart);
-        const spotBar: OHLCBar = spotFresh ? { t: windowStart, o: sLtp,   h: sLtp,   l: sLtp,   c: sLtp   } : MISSING_BAR(windowStart);
+        const futBar:  OHLCBar = (futLtp != null && !isNaN(futLtp)) ? { t: windowStart, o: futLtp, h: futLtp, l: futLtp, c: futLtp } : MISSING_BAR(windowStart);
+        const spotBar: OHLCBar = (sLtp != null && !isNaN(sLtp)) ? { t: windowStart, o: sLtp,   h: sLtp,   l: sLtp,   c: sLtp   } : MISSING_BAR(windowStart);
 
         const sessHigh = Math.max(swHighRef.current, futLtp);
         const sessLow  = Math.min(swLowRef.current,  futLtp);
@@ -754,8 +755,8 @@ export function Dashboard() {
 
         const callBar: OHLCBar = (ceFresh && !isNaN(b.callC)) ? { t: b.windowStart, o: b.callO, h: b.callH, l: b.callL, c: b.callC } : MISSING_BAR(b.windowStart);
         const putBar:  OHLCBar = (peFresh && !isNaN(b.putC))  ? { t: b.windowStart, o: b.putO,  h: b.putH,  l: b.putL,  c: b.putC  } : MISSING_BAR(b.windowStart);
-        const futBar:  OHLCBar = futFresh  ? { t: b.windowStart, o: b.futO,  h: b.futH,  l: b.futL,  c: b.futC  } : MISSING_BAR(b.windowStart);
-        const spotBar: OHLCBar = spotFresh ? { t: b.windowStart, o: b.spotO, h: b.spotH, l: b.spotL, c: b.spotC } : MISSING_BAR(b.windowStart);
+        const futBar:  OHLCBar = !isNaN(b.futC) ? { t: b.windowStart, o: b.futO,  h: b.futH,  l: b.futL,  c: b.futC  } : MISSING_BAR(b.windowStart);
+        const spotBar: OHLCBar = !isNaN(b.spotC) ? { t: b.windowStart, o: b.spotO, h: b.spotH, l: b.spotL, c: b.spotC } : MISSING_BAR(b.windowStart);
 
         const sessHigh = Math.max(swHighRef.current, b.futH);
         const sessLow  = Math.min(swLowRef.current,  b.futL);
@@ -803,7 +804,7 @@ export function Dashboard() {
           rating: ratingVal, signal: signalFromRating(ratingVal),
         });
 
-        if (spotLtp != null) dash.setLivePrices(spotLtp, futLtp);
+        if (sLtp != null) dash.setLivePrices(sLtp, futLtp);
       }
     }, 500);
 
