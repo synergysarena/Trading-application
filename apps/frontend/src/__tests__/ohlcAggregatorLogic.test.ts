@@ -26,50 +26,77 @@ class TestOhlcAggregator {
     return todaySessionOpenMs + Math.floor(offsetMs / timeframeMs) * timeframeMs;
   }
 
-  public aggregateOHLC(tick: Tick, timeframeMinutes: number, timeframeStr: string): Candle {
+  // Grace applied ONLY to timer-based finalization (mirrors PROACTIVE_FINALIZE_GRACE_MS)
+  public graceMs = 3000;
+
+  // Mirrors finaliseCandle: never let a re-finalization shrink an already
+  // captured real candle (the "flat bar overwrites the good bar" corruption).
+  private finalise(candle: Candle) {
+    const idx = this.finalizedCandles.findIndex(
+      c => c.symbol === candle.symbol && c.timeframe === candle.timeframe && c.openTime === candle.openTime
+    );
+    if (idx < 0) {
+      this.finalizedCandles.push({ ...candle });
+      return;
+    }
+    const existing = this.finalizedCandles[idx];
+    if (!existing.isSynthetic && !candle.isSynthetic) {
+      this.finalizedCandles[idx] = {
+        ...existing,
+        open: existing.open,
+        high: Math.max(existing.high, candle.high),
+        low: Math.min(existing.low, candle.low),
+        close: candle.close,
+        volume: Math.max(existing.volume, candle.volume),
+        isSynthetic: false,
+      };
+    } else {
+      this.finalizedCandles[idx] = { ...candle };
+    }
+  }
+
+  public aggregateOHLC(tick: Tick, timeframeMinutes: number, timeframeStr: string, nowMs?: number): Candle {
     const { symbol, ltp, timestamp, volume = 0 } = tick;
 
-    if (!this.activeCandles[symbol]) {
-      this.activeCandles[symbol] = {};
-    }
-    if (!this.lastKnownClose[symbol]) {
-      this.lastKnownClose[symbol] = {};
-    }
+    if (!this.activeCandles[symbol]) this.activeCandles[symbol] = {};
+    if (!this.lastKnownClose[symbol]) this.lastKnownClose[symbol] = {};
     this.lastKnownClose[symbol][timeframeStr] = ltp;
 
     const boundary = this.getBoundaryTime(timestamp, timeframeMinutes);
+    const wallBoundary = this.getBoundaryTime(new Date(nowMs ?? timestamp.getTime()), timeframeMinutes);
     let candle = this.activeCandles[symbol][timeframeStr];
 
     const syntheticIdx = this.finalizedCandles.findIndex(
       c => c.symbol === symbol && c.timeframe === timeframeStr && c.openTime === boundary && c.isSynthetic
     );
 
+    const mergeLateTickIntoFinalizedReal = (): Candle | null => {
+      const idx = this.finalizedCandles.findIndex(
+        c => c.symbol === symbol && c.timeframe === timeframeStr && c.openTime === boundary && !c.isSynthetic
+      );
+      if (idx < 0) return null;
+      const fin = this.finalizedCandles[idx];
+      fin.high = Math.max(fin.high, ltp);
+      fin.low = Math.min(fin.low, ltp);
+      fin.volume += volume;
+      return fin;
+    };
+
     if (!candle || candle.openTime < boundary) {
-      if (candle) {
-        this.finalizedCandles.push({ ...candle });
-      }
+      if (candle) this.finalise(candle);
 
       if (syntheticIdx >= 0) {
         const syn = this.finalizedCandles[syntheticIdx];
-        syn.open = ltp;
-        syn.high = ltp;
-        syn.low = ltp;
-        syn.close = ltp;
-        syn.volume = volume;
-        syn.isSynthetic = false;
+        syn.open = ltp; syn.high = ltp; syn.low = ltp; syn.close = ltp;
+        syn.volume = volume; syn.isSynthetic = false;
         candle = syn;
+      } else if (!candle && boundary < wallBoundary) {
+        // Late tick for an already-elapsed minute with no active candle.
+        const merged = mergeLateTickIntoFinalizedReal();
+        if (merged) return merged;
+        return { symbol, timeframe: timeframeStr, open: ltp, high: ltp, low: ltp, close: ltp, openTime: boundary, volume, isSynthetic: false };
       } else {
-        candle = {
-          symbol,
-          timeframe: timeframeStr,
-          open: ltp,
-          high: ltp,
-          low: ltp,
-          close: ltp,
-          openTime: boundary,
-          volume,
-          isSynthetic: false,
-        };
+        candle = { symbol, timeframe: timeframeStr, open: ltp, high: ltp, low: ltp, close: ltp, openTime: boundary, volume, isSynthetic: false };
       }
     } else if (candle.openTime === boundary) {
       candle.high = Math.max(candle.high, ltp);
@@ -77,22 +104,17 @@ class TestOhlcAggregator {
       candle.close = ltp;
       candle.volume += volume;
       candle.isSynthetic = false;
-      if (syntheticIdx >= 0) {
-        this.finalizedCandles[syntheticIdx] = { ...candle };
-      }
+      if (syntheticIdx >= 0) this.finalizedCandles[syntheticIdx] = { ...candle };
     } else {
-      // Out-of-order / late tick: check if replacing a synthetic bar for this exact boundary
+      // Out-of-order / late tick: synthetic replacement, else merge into finalized real, else drop.
       if (syntheticIdx >= 0) {
         const syn = this.finalizedCandles[syntheticIdx];
-        syn.open = ltp;
-        syn.high = ltp;
-        syn.low = ltp;
-        syn.close = ltp;
-        syn.volume = volume;
-        syn.isSynthetic = false;
+        syn.open = ltp; syn.high = ltp; syn.low = ltp; syn.close = ltp;
+        syn.volume = volume; syn.isSynthetic = false;
         return syn;
       }
-      // Late tick for already finalized real candle — do not corrupt active candle
+      const merged = mergeLateTickIntoFinalizedReal();
+      if (merged) return merged;
       return candle;
     }
 
@@ -102,13 +124,13 @@ class TestOhlcAggregator {
 
   // Simulates boundary checker tick for continuity
   public checkContinuity(nowMs: number, tfStr = "1m", tfMins = 1, sessionOpenMs = 0) {
-    // 1. Finalize expired active candles
+    // 1. Finalize expired active candles — only after the grace period.
     for (const symbol of Object.keys(this.activeCandles)) {
       const candle = this.activeCandles[symbol][tfStr];
       if (!candle) continue;
       const nextBoundary = candle.openTime + tfMins * 60000;
-      if (nowMs >= nextBoundary) {
-        this.finalizedCandles.push({ ...candle });
+      if (nowMs >= nextBoundary + this.graceMs) {
+        this.finalise(candle);
         delete this.activeCandles[symbol][tfStr];
         this.lastKnownClose[symbol][tfStr] = candle.close;
       }
@@ -141,7 +163,7 @@ class TestOhlcAggregator {
         volume: 0,
         isSynthetic: true,
       };
-      this.finalizedCandles.push(syntheticCandle);
+      this.finalise(syntheticCandle);
     }
   }
 }
@@ -237,12 +259,12 @@ describe("Module 1 OHLC Aggregator Logic", () => {
     aggregator.aggregateOHLC({ symbol: "NIFTY-FUT", ltp: 24200.0, timestamp: t0 }, 1, "1m");
 
     // Finalize 10:00 at 10:01:00
-    aggregator.checkContinuity(new Date("2026-08-24T04:31:00.000Z").getTime(), "1m", 1);
+    aggregator.checkContinuity(new Date("2026-08-24T04:31:05.000Z").getTime(), "1m", 1); // past 3s grace
     expect(aggregator.finalizedCandles.length).toBe(1);
     expect(aggregator.finalizedCandles[0].isSynthetic).toBe(false);
 
     // Minute 10:01 has NO ticks at all! Time advances to 10:02:01
-    aggregator.checkContinuity(new Date("2026-08-24T04:32:01.000Z").getTime(), "1m", 1);
+    aggregator.checkContinuity(new Date("2026-08-24T04:32:05.000Z").getTime(), "1m", 1); // past 3s grace
 
     // Should now have 2 finalized candles: 10:00 (real) and 10:01 (synthetic carry-forward)
     expect(aggregator.finalizedCandles.length).toBe(2);
@@ -261,11 +283,11 @@ describe("Module 1 OHLC Aggregator Logic", () => {
     aggregator.aggregateOHLC({ symbol: "NIFTY26AUG24200C", ltp: 110.0, timestamp: new Date("2026-08-24T04:30:10.000Z") }, 1, "1m");
 
     // Finalize 10:00
-    aggregator.checkContinuity(new Date("2026-08-24T04:31:00.000Z").getTime(), "1m", 1);
+    aggregator.checkContinuity(new Date("2026-08-24T04:31:05.000Z").getTime(), "1m", 1); // past 3s grace
     expect(aggregator.finalizedCandles.filter(c => c.symbol === "NIFTY26AUG24200C").length).toBe(1);
 
     // Minute 10:01 has no option ticks
-    aggregator.checkContinuity(new Date("2026-08-24T04:32:01.000Z").getTime(), "1m", 1);
+    aggregator.checkContinuity(new Date("2026-08-24T04:32:05.000Z").getTime(), "1m", 1); // past 3s grace
 
     // Option should NOT have a synthetic 10:01 candle
     const optionCandles = aggregator.finalizedCandles.filter(c => c.symbol === "NIFTY26AUG24200C");
@@ -275,10 +297,10 @@ describe("Module 1 OHLC Aggregator Logic", () => {
   it("Replaces synthetic candle with real tick if a real tick arrives matching that exact minute boundary", () => {
     // Minute 10:00
     aggregator.aggregateOHLC({ symbol: "NIFTY-FUT", ltp: 24200.0, timestamp: new Date("2026-08-24T04:30:10.000Z") }, 1, "1m");
-    aggregator.checkContinuity(new Date("2026-08-24T04:31:00.000Z").getTime(), "1m", 1);
+    aggregator.checkContinuity(new Date("2026-08-24T04:31:05.000Z").getTime(), "1m", 1); // past 3s grace
 
     // Minute 10:01: no tick yet -> synthetic candle created at 10:02
-    aggregator.checkContinuity(new Date("2026-08-24T04:32:01.000Z").getTime(), "1m", 1);
+    aggregator.checkContinuity(new Date("2026-08-24T04:32:05.000Z").getTime(), "1m", 1); // past 3s grace
     expect(aggregator.finalizedCandles[1].isSynthetic).toBe(true);
 
     // Real tick with broker timestamp in 10:01 (e.g. 10:01:45) arrives
@@ -305,5 +327,95 @@ describe("Module 1 OHLC Aggregator Logic", () => {
     expect(activeAfter.high).toBe(activeBefore.high);
     expect(activeAfter.low).toBe(activeBefore.low);
     expect(activeAfter.close).toBe(activeBefore.close);
+  });
+
+  // ── Regression: late-tick-after-proactive-finalization corruption ──────────
+  // Before the fix: the boundary checker finalized a multi-tick 10:00 candle at
+  // exactly 10:01:00; a feed-lagged in-minute tick arriving at ~10:01:01 then
+  // recreated a fresh 1-tick candle for 10:00 which, on its own finalization,
+  // OVERWROTE the correct 10:00 candle (cache + MongoDB) with a flat bar.
+
+  it("grace period keeps a feed-lagged in-minute tick in the same candle (no premature finalize)", () => {
+    // 10:00 candle: two ticks
+    aggregator.aggregateOHLC({ symbol: "NIFTY-FUT", ltp: 100, timestamp: new Date("2026-08-24T04:30:10.000Z") }, 1, "1m");
+    aggregator.aggregateOHLC({ symbol: "NIFTY-FUT", ltp: 105, timestamp: new Date("2026-08-24T04:30:40.000Z") }, 1, "1m");
+
+    // Boundary checker fires at 10:01:00.5 — WITHIN the 3s grace → must NOT finalize yet.
+    aggregator.checkContinuity(new Date("2026-08-24T04:31:00.500Z").getTime(), "1m", 1);
+    expect(aggregator.finalizedCandles.length).toBe(0);
+    expect(aggregator.activeCandles["NIFTY-FUT"]["1m"].openTime).toBe(new Date("2026-08-24T04:30:00.000Z").getTime());
+
+    // A feed-lagged tick for 10:00 (ft=10:00:58) arrives at wall-clock 10:01:01
+    const c = aggregator.aggregateOHLC(
+      { symbol: "NIFTY-FUT", ltp: 96, timestamp: new Date("2026-08-24T04:30:58.000Z") },
+      1, "1m",
+      new Date("2026-08-24T04:31:01.000Z").getTime()
+    );
+    // It lands in the SAME 10:00 candle and extends the low.
+    expect(c.openTime).toBe(new Date("2026-08-24T04:30:00.000Z").getTime());
+    expect(c.open).toBe(100);
+    expect(c.high).toBe(105);
+    expect(c.low).toBe(96);
+
+    // Now finalize past the grace.
+    aggregator.checkContinuity(new Date("2026-08-24T04:31:04.000Z").getTime(), "1m", 1);
+    expect(aggregator.finalizedCandles).toHaveLength(1);
+    expect([
+      aggregator.finalizedCandles[0].open,
+      aggregator.finalizedCandles[0].high,
+      aggregator.finalizedCandles[0].low,
+    ]).toEqual([100, 105, 96]);
+  });
+
+  it("a late tick AFTER finalization extends the finalized candle's H/L, never collapses it", () => {
+    // 10:00 candle: O=100 H=105 L=98 C=102 (multi-tick), finalized past grace.
+    aggregator.aggregateOHLC({ symbol: "NIFTY-FUT", ltp: 100, timestamp: new Date("2026-08-24T04:30:05.000Z") }, 1, "1m");
+    aggregator.aggregateOHLC({ symbol: "NIFTY-FUT", ltp: 105, timestamp: new Date("2026-08-24T04:30:20.000Z") }, 1, "1m");
+    aggregator.aggregateOHLC({ symbol: "NIFTY-FUT", ltp: 98,  timestamp: new Date("2026-08-24T04:30:40.000Z") }, 1, "1m");
+    aggregator.aggregateOHLC({ symbol: "NIFTY-FUT", ltp: 102, timestamp: new Date("2026-08-24T04:30:55.000Z") }, 1, "1m");
+    aggregator.checkContinuity(new Date("2026-08-24T04:31:05.000Z").getTime(), "1m", 1);
+    expect(aggregator.finalizedCandles).toHaveLength(1);
+    const before = { ...aggregator.finalizedCandles[0] };
+    expect([before.open, before.high, before.low, before.close]).toEqual([100, 105, 98, 102]);
+
+    // Feed-lagged tick for 10:00 arrives at wall-clock 10:01:07 with a NEW low.
+    aggregator.aggregateOHLC(
+      { symbol: "NIFTY-FUT", ltp: 95, timestamp: new Date("2026-08-24T04:30:59.000Z"), volume: 3 },
+      1, "1m",
+      new Date("2026-08-24T04:31:07.000Z").getTime()
+    );
+
+    // Still exactly ONE 10:00 candle. Open/close preserved, low extended — NOT a flat 95/95/95/95 bar.
+    const tenAm = aggregator.finalizedCandles.filter(c => c.openTime === new Date("2026-08-24T04:30:00.000Z").getTime());
+    expect(tenAm).toHaveLength(1);
+    expect(tenAm[0].open).toBe(100);
+    expect(tenAm[0].high).toBe(105);
+    expect(tenAm[0].low).toBe(95);
+    expect(tenAm[0].close).toBe(102);
+    // No bogus active candle for the past minute was created.
+    expect(aggregator.activeCandles["NIFTY-FUT"]["1m"]).toBeUndefined();
+  });
+
+  it("finalise() never lets a re-finalization shrink an already-captured real candle", () => {
+    // Directly exercise the merge-guard: a good candle already finalized…
+    (aggregator as any).finalise({ symbol: "NIFTY-FUT", timeframe: "1m", open: 100, high: 110, low: 90, close: 105, openTime: 1000, volume: 500, isSynthetic: false });
+    // …then a stray flat re-finalization for the same minute.
+    (aggregator as any).finalise({ symbol: "NIFTY-FUT", timeframe: "1m", open: 96, high: 96, low: 96, close: 96, openTime: 1000, volume: 1, isSynthetic: false });
+
+    const c = aggregator.finalizedCandles.find(x => x.openTime === 1000)!;
+    expect(aggregator.finalizedCandles.filter(x => x.openTime === 1000)).toHaveLength(1);
+    expect(c.open).toBe(100);   // original open kept
+    expect(c.high).toBe(110);   // not shrunk
+    expect(c.low).toBe(90);     // not shrunk (96 > 90)
+    expect(c.close).toBe(96);   // close follows the latest
+    expect(c.volume).toBe(500); // larger volume kept, not overwritten with 1
+  });
+
+  it("a genuine single-tick minute still finalizes as a valid flat candle (not treated as a bug)", () => {
+    aggregator.aggregateOHLC({ symbol: "NIFTY-SPOT", ltp: 24123.0, timestamp: new Date("2026-08-24T04:30:30.000Z") }, 1, "1m");
+    aggregator.checkContinuity(new Date("2026-08-24T04:31:05.000Z").getTime(), "1m", 1);
+    const c = aggregator.finalizedCandles[0];
+    expect([c.open, c.high, c.low, c.close]).toEqual([24123.0, 24123.0, 24123.0, 24123.0]);
+    expect(c.isSynthetic).toBe(false);
   });
 });

@@ -12,6 +12,7 @@ import {
 } from "./zebuMarketDataClient";
 import { broadcastBrokerStatus, resetMarketReady } from "./socketService";
 import { getActiveInstrumentTokens, refreshInstrumentTokens, recomputeOptionBandFromLivePrice } from "./instrumentTokenService";
+import { isOhlcAuditEnabled, recordPipelineTick } from "./module1OhlcAudit";
 
 let zebuClient: { close: () => void; subscribeTokens?: (instruments: ZebuInstrument[]) => void } | null = null;
 
@@ -311,6 +312,15 @@ export const processIncomingTick = async (tick: Tick) => {
   }
 
   recordTickReceived();
+
+  // Diagnostic (MODULE1_OHLC_AUDIT=true only): count every normalized tick that
+  // enters the pipeline, bucketed by the tick's own minute, so a finalized flat
+  // candle can be proven single-tick vs. lost-ticks. Uses the tick timestamp
+  // (same value the aggregator buckets on) so pipeline and aggregator counts
+  // are directly comparable.
+  if (isOhlcAuditEnabled() && (symbol === "NIFTY-FUT" || symbol === "NIFTY-SPOT")) {
+    recordPipelineTick(symbol, tick.timestamp.getTime(), ltp);
+  }
 
   // Phase 6: coalesced, non-blocking Redis writes — the buffer flushes the latest
   // value per key in one pipelined request every 500ms instead of issuing 2-3

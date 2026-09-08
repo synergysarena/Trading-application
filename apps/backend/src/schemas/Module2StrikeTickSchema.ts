@@ -20,6 +20,15 @@ export const Module2StrikeTickSchema = new Schema({
     type: Number,
     required: true,
   },
+  // True when no legitimate live/previous price was available for this minute
+  // and the snapshot fell back to a baseline (or 0). Lets the UI and the
+  // reconciliation endpoint distinguish "real captured price" from "placeholder
+  // because the strike had no tick and no prior value" without fabricating data.
+  // Backward-compatible: absent on pre-existing documents → treated as false.
+  ltp_missing: {
+    type: Boolean,
+    default: false,
+  },
   is_day_high: {
     type: Boolean,
     default: false,

@@ -25,7 +25,8 @@ import systemRouter from "./routes/system";
 import { getZebuOAuthStatusEndpoint, zebuOAuthCallback } from "./controllers/zebuOAuth";
 import { initPivotService } from "./services/pivotService";
 import { initSocketServer } from "./services/socketService";
-import { initTrackerEngine } from "./services/trackerService";
+import { initTrackerEngine, stopTrackerEngine, getModule2RuntimeStats } from "./services/trackerService";
+import { flushPendingPersistence } from "./services/module2PersistenceService";
 import { initSubscriptionSync } from "./services/subscriptionSyncService";
 import { initMarketDataCache } from "./services/marketDataCacheService";
 import { initMinuteAggregation } from "./services/minuteAggregationService";
@@ -189,6 +190,13 @@ app.get("/health", async (_req, res) => {
   const { getStatus: getWsStatus } = require("./services/marketDataWebSocketService");
   const wsStatus = getWsStatus ? getWsStatus() : null;
 
+  let module2Tracker: any = null;
+  try {
+    module2Tracker = getModule2RuntimeStats();
+  } catch (err: any) {
+    module2Tracker = { error: err?.message || String(err) };
+  }
+
   res.json({
     backend: "healthy",
     status: monitoring.status === "OK" ? "healthy" : "warning",
@@ -200,6 +208,7 @@ app.get("/health", async (_req, res) => {
       aetramMarketSocket: wsStatus ? wsStatus.state.toLowerCase() : "unknown",
     },
     monitoring,
+    module2Tracker,
   });
 });
 
@@ -318,8 +327,11 @@ const startServer = async () => {
   initCandleHistory();
 
   // ── Step 3: Initialize services ──────────────────────────────────────────
+  // initTrackerEngine() ensures indexes and recovers ACTIVE sessions from
+  // MongoDB (so minute persistence survives a restart) before scheduling the
+  // minute-boundary loop. Non-fatal — a failure here must not stop the server.
   try {
-    initTrackerEngine();
+    await initTrackerEngine();
   } catch (err) {
     console.warn("[Server] TrackerEngine init warning:", err);
   }
@@ -377,6 +389,18 @@ const shutdown = (signal: string) => {
     stopMonitoringLoop();
     stopSessionManager();
     stopDataFeed(true);
+
+    // Module 2: stop scheduling new minute boundaries and let any in-flight
+    // strike-tick persistence finish. ACTIVE sessions are deliberately LEFT
+    // ACTIVE in MongoDB — a redeploy is not a Stop; initTrackerEngine()
+    // recovers them on the next boot (Problem 17).
+    try {
+      stopTrackerEngine();
+      await flushPendingPersistence();
+    } catch (err: any) {
+      console.warn("[Server] Module 2 persistence flush warning during shutdown:", err?.message || err);
+    }
+
     try {
       const mongoose = require("mongoose");
       await mongoose.connection.close();

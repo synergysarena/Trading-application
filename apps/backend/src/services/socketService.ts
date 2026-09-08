@@ -293,6 +293,19 @@ export const broadcastTrackerUpdate = (sessionId: string, data: any) => {
   }
 };
 
+/**
+ * Broadcasts the DURABLE-PERSISTENCE outcome for a finalized minute of a
+ * Module 2 tracker session. This is separate from `tracker_update` (which
+ * carries the live cell and is emitted regardless of the DB): it tells the UI
+ * / diagnostics whether that minute actually reached MongoDB, without ever
+ * gating the live display on the write.
+ */
+export const broadcastTrackerPersistence = (sessionId: string, data: any) => {
+  if (ioServer) {
+    ioServer.to(`tracker:${sessionId}`).emit("tracker_persistence", data);
+  }
+};
+
 export type BrokerStatus =
   | "live"
   | "reconnecting"

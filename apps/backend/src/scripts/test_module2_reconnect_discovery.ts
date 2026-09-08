@@ -1,8 +1,11 @@
 import assert from "assert";
+import mongoose from "mongoose";
 import { parseDateToYMD, searchInstruments, clearSearchCache, clearActiveSubscribedMap, getActiveSubscribedInstruments, subscribeToInstruments } from "../services/aetramMarketDataService";
 import { loginMarketData, getMarketDataToken, isMarketDataAuthenticated, markMarketDataSessionExpired } from "../services/marketDataSessionService";
-import { activeSessions, syncAetramSubscriptions, startTrackerSession } from "../services/trackerService";
+import { activeSessions, syncAetramSubscriptions, startTrackerSession, TrackerStartupError } from "../services/trackerService";
 import { getSyncStatus } from "../services/subscriptionSyncService";
+import { Module2Session } from "../models/Module2Session";
+import { Module2StrikeTick } from "../models/Module2StrikeTick";
 
 async function runTests() {
   console.log("========================================================");
@@ -137,36 +140,70 @@ async function runTests() {
     delete activeSessions[k];
   }
 
-  // ---------------------------------------------------------------------------
-  // TEST 8: 20-Strike (10 CE + 10 PE) Performance & Batch Lookup
-  // ---------------------------------------------------------------------------
-  console.log("\n[TEST 8] 20 Strikes (10 CE + 10 PE) Startup Performance...");
   const ce20Strikes = Array.from({ length: 10 }, (_, i) => `NIFTY${24000 + i * 50}CE`);
   const pe20Strikes = Array.from({ length: 10 }, (_, i) => `NIFTY${24000 + i * 50}PE`);
   const all20Strikes = [...ce20Strikes, ...pe20Strikes];
-  assert.strictEqual(all20Strikes.length, 20, "Must have exactly 20 strikes for test");
 
-  const start20Time = Date.now();
-  const session20 = await startTrackerSession(
-    "perf-test-user",
-    "mixed",
-    "NIFTY50",
-    "2026-09-03",
-    all20Strikes
+  // ---------------------------------------------------------------------------
+  // TEST 8a: DB unavailable → clean rejection, NO fake session (Problem 2 / 3)
+  // ---------------------------------------------------------------------------
+  console.log("\n[TEST 8a] Start with MongoDB unavailable must FAIL cleanly (no mock-session)...");
+  const forceReadyState = (v: number) =>
+    Object.defineProperty(mongoose.connection, "readyState", { value: v, configurable: true });
+  forceReadyState(0);
+  const activeBefore = Object.keys(activeSessions).length;
+  let rejected = false;
+  try {
+    await startTrackerSession("perf-test-user", "mixed", "NIFTY50", "2026-09-03", all20Strikes);
+  } catch (err: any) {
+    rejected = err instanceof TrackerStartupError;
+  }
+  assert.strictEqual(rejected, true, "startTrackerSession must reject with TrackerStartupError when DB is down");
+  assert.strictEqual(Object.keys(activeSessions).length, activeBefore, "No in-memory session may be registered on failure");
+  assert.strictEqual(
+    Object.keys(activeSessions).some((id) => id.startsWith("mock-session-")),
+    false,
+    "No mock-session-* id may ever be created"
   );
-  const elapsed20 = Date.now() - start20Time;
-  assert.strictEqual(session20.selectedStrikes.length, 20, "Session must have all 20 strikes");
-  assert.strictEqual(elapsed20 < 3000, true, `20-strike start must complete in <3000ms (took ${elapsed20}ms)`);
-  console.log(`✓ 20 strikes initialized in ${elapsed20}ms (well below 10s/30s timeout).`);
+  console.log("✓ DB-down start rejected cleanly; no fake session registered.");
 
-  delete activeSessions[session20.sessionId];
+  // ---------------------------------------------------------------------------
+  // TEST 8b: 20-Strike (10 CE + 10 PE) startup with a real ObjectId (DB mocked)
+  // ---------------------------------------------------------------------------
+  console.log("\n[TEST 8b] 20 Strikes startup yields a real MongoDB ObjectId...");
+  forceReadyState(1);
+  const realId = new mongoose.Types.ObjectId();
+  const origCreate = (Module2Session as any).create;
+  const origFind = (Module2StrikeTick as any).find;
+  const origSessFind = (Module2Session as any).find;
+  (Module2Session as any).create = async (d: any) => ({ ...d, _id: realId, created_at: new Date() });
+  (Module2Session as any).find = () => ({ select: () => ({ lean: async () => [] }) });
+  (Module2StrikeTick as any).find = () => ({ sort: () => ({ lean: async () => [] }) });
+  try {
+    const start20Time = Date.now();
+    const session20 = await startTrackerSession("perf-test-user", "mixed", "NIFTY50", "2026-09-03", all20Strikes);
+    const elapsed20 = Date.now() - start20Time;
+    assert.strictEqual(session20.selectedStrikes.length, 20, "Session must have all 20 strikes");
+    assert.strictEqual(mongoose.isValidObjectId(session20.sessionId), true, "sessionId must be a real ObjectId");
+    assert.strictEqual(session20.sessionId, realId.toString(), "sessionId must be the persisted _id");
+    assert.strictEqual(elapsed20 < 3000, true, `20-strike start must complete in <3000ms (took ${elapsed20}ms)`);
+    console.log(`✓ 20 strikes initialized in ${elapsed20}ms with real _id ${session20.sessionId}.`);
+    delete activeSessions[session20.sessionId];
+  } finally {
+    (Module2Session as any).create = origCreate;
+    (Module2Session as any).find = origSessFind;
+    (Module2StrikeTick as any).find = origFind;
+    forceReadyState(0);
+  }
 
   console.log("\n========================================================");
-  console.log("=== ALL REGRESSION TESTS PASSED SUCCESSFULLY (8/8)   ===");
+  console.log("=== ALL REGRESSION TESTS PASSED SUCCESSFULLY (9/9)   ===");
   console.log("========================================================");
 }
 
-runTests().catch((err) => {
-  console.error("Test failed with error:", err);
-  process.exit(1);
-});
+runTests()
+  .then(() => process.exit(0))
+  .catch((err) => {
+    console.error("Test failed with error:", err);
+    process.exit(1);
+  });

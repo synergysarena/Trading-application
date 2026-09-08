@@ -367,7 +367,37 @@ export const Module2 = ({ isSplit = false }: { isSplit?: boolean }) => {
   const queryClient = useQueryClient();
   const activeSession = useStore((s) => s.activeSession);
   const setActiveSession = useStore((s) => s.setActiveSession);
+  const hydrateActiveSession = useStore((s) => s.hydrateActiveSession);
   const module2BrokerStatus = useStore((s) => s.module2BrokerStatus);
+
+  // Session rehydration: after a browser refresh / socket reconnect / backend
+  // redeploy the in-memory Zustand session is gone. Ask the backend for the
+  // user's current ACTIVE session (it rebuilds the grid from module2striketicks)
+  // and restore it instead of forcing the user to click Start again. Never
+  // creates a new session.
+  const hasHydratedRef = useRef(false);
+  const { data: currentSessionData } = useQuery({
+    queryKey: ["module2-current-session"],
+    queryFn: async () => {
+      const res = await api.get("/api/module2/session/current");
+      return res || null;
+    },
+    staleTime: Infinity,
+    refetchOnWindowFocus: false,
+    retry: 1,
+  });
+
+  useEffect(() => {
+    if (hasHydratedRef.current) return;
+    if (currentSessionData && currentSessionData.sessionId) {
+      console.log("[MODULE2][TRACKER] Restoring ACTIVE session from backend:", currentSessionData.sessionId);
+      hydrateActiveSession(currentSessionData);
+      hasHydratedRef.current = true;
+    } else if (currentSessionData === null) {
+      // Query resolved with "no active session" — nothing to restore.
+      hasHydratedRef.current = true;
+    }
+  }, [currentSessionData, hydrateActiveSession]);
   const [isConfigExpanded, setIsConfigExpanded] = useState(!isSplit);
 
   const [indexSymbol, setIndexSymbol] = useState("NIFTY50");
@@ -709,9 +739,18 @@ export const Module2 = ({ isSplit = false }: { isSplit?: boolean }) => {
     onSuccess: (data) => {
       console.log("[MODULE2][TRACKER] Mutation success, active session updated");
       setActiveSession(data);
+      hasHydratedRef.current = true;
+      queryClient.setQueryData(["module2-current-session"], data);
     },
     onError: (error: any) => {
       console.error("[MODULE2][TRACKER] Request failed:", error?.message || error);
+      // Surface a durable-start failure (e.g. DB unavailable → HTTP 503) so the
+      // user knows tracking did NOT begin, rather than seeing a silent no-op.
+      if (error?.reason === "DB_UNAVAILABLE" || error?.reason === "SESSION_PERSIST_FAILED") {
+        setStrikeWarning(error.message || "Tracker could not be started — the session could not be saved. Please try again.");
+      } else if (error?.message) {
+        setStrikeWarning(error.message);
+      }
     }
   });
 
@@ -739,11 +778,13 @@ export const Module2 = ({ isSplit = false }: { isSplit?: boolean }) => {
       setActiveSession(null);
       setSelectedStrikes([]);
       setStrikeWarning(null);
+      queryClient.setQueryData(["module2-current-session"], null);
     },
     onError: () => {
       setActiveSession(null);
       setSelectedStrikes([]);
       setStrikeWarning(null);
+      queryClient.setQueryData(["module2-current-session"], null);
     }
   });
 
@@ -944,6 +985,35 @@ export const Module2 = ({ isSplit = false }: { isSplit?: boolean }) => {
               <div>
                 <div style={{ fontFamily: "'Inter', sans-serif", fontSize: 13, fontWeight: 700, color: "#d97706" }}>Disconnected</div>
                 <div style={{ fontFamily: "'Inter', sans-serif", fontSize: 12, color: "#d97706", opacity: 0.8, marginTop: 2 }}>Attempting to reconnect to broker…</div>
+              </div>
+            </div>
+          )}
+
+          {/* Market Closed — top status bar only. The Strike Tracker tables below
+              stay visible with all existing/stored data; only LIVE updates stop. */}
+          {isClosed && (
+            <div
+              className="m2-section"
+              style={{
+                background: "rgba(229,57,53,0.12)",
+                border: "2px solid rgba(229,57,53,0.55)",
+                borderLeft: "6px solid #E53935",
+                borderRadius: 10,
+                padding: "14px 20px",
+                display: "flex",
+                alignItems: "center",
+                gap: 12,
+                boxShadow: "0 2px 10px rgba(229,57,53,0.18)",
+              }}
+            >
+              <span style={{ fontSize: 20, color: "#E53935", lineHeight: 1 }}>⚠</span>
+              <div>
+                <div style={{ fontFamily: "'Inter', sans-serif", fontSize: 14, fontWeight: 800, color: "#C62828", letterSpacing: "0.01em", textTransform: "uppercase" }}>
+                  Market Closed — Live market data stopped at 3:30 PM IST
+                </div>
+                <div style={{ fontFamily: "'Inter', sans-serif", fontSize: 12, fontWeight: 600, color: "#C62828", opacity: 0.9, marginTop: 3 }}>
+                  Live updates are paused. All tracked strike data below remains visible.
+                </div>
               </div>
             </div>
           )}
@@ -1255,7 +1325,6 @@ export const Module2 = ({ isSplit = false }: { isSplit?: boolean }) => {
                 sortedTimestamps={sortedTimestamps}
                 selectedOHLCFields={selectedOHLCFields}
                 isSplit={isSplit}
-                isClosed={isClosed}
               />
             </div>
 
@@ -1273,7 +1342,6 @@ export const Module2 = ({ isSplit = false }: { isSplit?: boolean }) => {
                 sortedTimestamps={sortedTimestamps}
                 selectedOHLCFields={selectedOHLCFields}
                 isSplit={isSplit}
-                isClosed={isClosed}
               />
             </div>
           </div>
@@ -1333,14 +1401,12 @@ function StrikeTrackerTable({
   sortedTimestamps,
   selectedOHLCFields = ["open", "high", "low", "close"],
   isSplit = false,
-  isClosed = false,
 }: {
   strikesList: string[];
   session: any;
   sortedTimestamps: string[];
   selectedOHLCFields?: string[];
   isSplit?: boolean;
-  isClosed?: boolean;
 }) {
   const [showFullColumns, setShowFullColumns] = useState(false);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -1444,13 +1510,9 @@ function StrikeTrackerTable({
             </tr>
           </thead>
           <tbody>
-            {isClosed ? (
-              <tr>
-                <td colSpan={totalColsCount} style={{ padding: "48px 16px", textAlign: "center", fontFamily: "'Inter', sans-serif", fontSize: 24, color: "#E53935", fontWeight: 700 }}>
-                  Market Closed
-                </td>
-              </tr>
-            ) : displayedStrikes.length === 0 ? (
+            {/* Market-closed no longer replaces the table — the top status bar
+                carries that message and the rows below stay exactly as-is. */}
+            {displayedStrikes.length === 0 ? (
               <tr>
                 <td colSpan={totalColsCount} style={{ padding: "32px 16px", textAlign: "center", fontFamily: "'Inter', sans-serif", fontSize: 24, color: "var(--trading-text-muted)" }}>
                   No strikes to display in this category.

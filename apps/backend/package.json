@@ -10,7 +10,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/server.js",
-    "dev": "ts-node-dev --respawn --transpile-only src/server.ts"
+    "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
+    "test": "ts-node --transpile-only src/scripts/test_module2_persistence.ts && ts-node --transpile-only src/scripts/test_module2_reconnect_discovery.ts && ts-node --transpile-only src/scripts/test_module2_market_hours.ts && ts-node --transpile-only src/scripts/test_module1_ohlc_audit.ts"
   },
   "dependencies": {
     "@stock/shared": "*",

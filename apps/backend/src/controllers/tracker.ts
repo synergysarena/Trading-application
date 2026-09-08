@@ -6,7 +6,9 @@ import {
   stopTrackerSession,
   updateTrackerStrikes,
   getSessionData,
-  activeSessions
+  resumeSessionForUser,
+  activeSessions,
+  TrackerStartupError,
 } from "../services/trackerService";
 import {
   Module2SessionStartSchema,
@@ -71,6 +73,12 @@ export const startSession = async (req: AuthenticatedRequest, res: Response) => 
     }
     return res.status(201).json(session);
   } catch (error) {
+    // A tracker session that cannot be durably persisted fails cleanly — no
+    // in-memory session, no subscriptions, no fake id (Problem 2 / 3).
+    if (error instanceof TrackerStartupError) {
+      console.warn(`[MODULE2][TRACKER] Start rejected (${error.reason}): ${error.message}`);
+      return res.status(503).json({ error: error.message, reason: error.reason });
+    }
     console.error("[MODULE2][TRACKER] Start Session Error:", error);
     return res.status(500).json({ error: "Internal Server Error" });
   }
@@ -124,7 +132,12 @@ export const stopSession = async (req: AuthenticatedRequest, res: Response) => {
 };
 
 
-// Get current active session for user
+// Get current active session for user.
+// Checks the in-memory engine first; if absent (backend restart, browser
+// refresh, socket reconnect) it recovers the user's ACTIVE session from
+// MongoDB — rebuilding the full grid from module2striketicks — so the client
+// never loses its tracker (Problem 5). A session left ACTIVE from a previous
+// trading day is transitioned to STOPPED and null is returned.
 export const getCurrentSession = async (req: AuthenticatedRequest, res: Response) => {
   try {
     const userId = req.user?.id;
@@ -132,16 +145,8 @@ export const getCurrentSession = async (req: AuthenticatedRequest, res: Response
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    // Only return a session if it is actively running in memory
-    const userActiveSession = Object.values(activeSessions).find(
-      (s) => s.userId === userId
-    );
-
-    if (userActiveSession) {
-      return res.status(200).json(userActiveSession);
-    }
-
-    return res.status(200).json(null);
+    const session = await resumeSessionForUser(userId);
+    return res.status(200).json(session || null);
   } catch (error) {
     console.error("Get Current Session Error:", error);
     return res.status(500).json({ error: "Internal Server Error" });

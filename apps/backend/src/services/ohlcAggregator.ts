@@ -3,6 +3,28 @@ import { Tick, Candle } from "@stock/shared";
 import { readLive } from "./redisWriteBuffer";
 import { archiveModule1Candles } from "./module1ArchiveService";
 import { isMarketDataProcessingEnabled } from "./marketDataLifecycle";
+import { isOhlcAuditEnabled, auditLog, getPipelineMinute } from "./module1OhlcAudit";
+
+/**
+ * Grace period applied to TIMER-based (proactive) candle finalization only.
+ *
+ * The boundary checker fires every 1s; without a grace period it finalizes a
+ * candle the instant wall-clock passes its boundary. Broker feed timestamps
+ * (Zebu `ft`) lag wall-clock by 1-3s, so genuinely in-minute ticks kept
+ * arriving AFTER finalization — and because the active candle was already
+ * deleted, each such late tick used to recreate a fresh 1-tick candle for the
+ * (past) minute, which then OVERWROTE the correct multi-tick candle in the
+ * cache and in MongoDB with a flat open=high=low=close bar.
+ *
+ * A tick that itself crosses the boundary still finalizes the old candle
+ * immediately (that path is unaffected) — the grace only delays the fallback
+ * TIMER finalization for a quiet symbol.
+ */
+const PROACTIVE_FINALIZE_GRACE_MS = Number(process.env.MODULE1_LATE_TICK_GRACE_MS) || 3000;
+
+// ── Per-candle tick audit (diagnostic only) ─────────────────────────────────
+interface CandleAudit { ticks: number; prices: Set<number>; first: number; last: number }
+const candleAudit = new WeakMap<Candle, CandleAudit>();
 
 // Symbols that require continuous minute timeline (synthetic carry-forward when no tick arrives)
 // Option contracts are strictly tick-based and NOT synthesized automatically.
@@ -75,7 +97,10 @@ export const startBoundaryChecker = () => {
 
         const nextBoundary = candle.openTime + tfMins * 60000;
 
-        if (now >= nextBoundary) {
+        // Grace period: let feed-timestamp-lagged in-minute ticks land in this
+        // candle before the timer finalizes it. A tick that crosses the
+        // boundary still finalizes it immediately (see aggregateOHLC).
+        if (now >= nextBoundary + PROACTIVE_FINALIZE_GRACE_MS) {
           if (!isMarketDataProcessingEnabled()) return;
           console.log(`[MODULE1][BOUNDARY] Proactive finalization for ${symbol} (${tfStr}) at ${new Date(candle.openTime).toISOString()}.`);
           const candleToFinalize = candle;
@@ -233,11 +258,42 @@ export const aggregateOHLC = async (tick: Tick, timeframeMinutes: number, timefr
   lastKnownClose[symbol][timeframeStr] = ltp;
 
   const boundary = getBoundaryTime(timestamp, timeframeMinutes);
+  // The minute the WALL CLOCK is currently in — used to tell "first tick of a
+  // brand-new minute" (boundary === wallBoundary) apart from "late tick for a
+  // minute that already closed" (boundary < wallBoundary).
+  const wallBoundary = getBoundaryTime(new Date(), timeframeMinutes);
   let candle = activeCandles[symbol][timeframeStr];
 
   // Check if a synthetic candle was previously finalized for this boundary
   const cachedList = finalizedCandlesCache[symbol]?.[timeframeStr] || [];
   const syntheticIdx = cachedList.findIndex(c => c.openTime === boundary && c.isSynthetic);
+
+  /**
+   * A real tick arrived for a minute that was ALREADY finalized as a real
+   * candle (feed-timestamp lag past the grace window, or a genuine
+   * out-of-order delivery). Extend that finalized candle's high/low if this
+   * trade fell outside the captured range, then re-persist it. NEVER recreate
+   * an active candle for a past minute and NEVER reset open/close — that is
+   * exactly what used to collapse a multi-tick candle into a flat bar.
+   */
+  const mergeLateTickIntoFinalizedReal = (): Candle | null => {
+    const idx = cachedList.findIndex(c => c.openTime === boundary && !c.isSynthetic);
+    if (idx < 0) return null;
+    const fin = cachedList[idx];
+    const newHigh = Math.max(fin.high, ltp);
+    const newLow = Math.min(fin.low, ltp);
+    if (newHigh === fin.high && newLow === fin.low) {
+      // Nothing to change — the late tick is within the already-captured range.
+      return fin;
+    }
+    fin.high = newHigh;
+    fin.low = newLow;
+    fin.volume += volume;
+    console.log(`[MODULE1][AGGREGATOR] Late real tick merged into finalized ${symbol} (${timeframeStr}) at ${new Date(boundary).toISOString()} — H/L extended to ${fin.high}/${fin.low}.`);
+    persistQueue.push({ ...fin });
+    void drainPersistQueue();
+    return fin;
+  };
 
   if (!candle || candle.openTime < boundary) {
     // If there is an existing active candle, finalize it first
@@ -255,11 +311,25 @@ export const aggregateOHLC = async (tick: Tick, timeframeMinutes: number, timefr
       syn.volume = volume;
       syn.isSynthetic = false;
       console.log(`[MODULE1][AGGREGATOR] Real tick arrived for synthetic candle ${symbol} (${timeframeStr}) at ${new Date(boundary).toISOString()} — replaced synthetic bar.`);
+      candleAudit.set(syn, { ticks: 1, prices: new Set([ltp]), first: ltp, last: ltp });
       persistQueue.push({ ...syn });
       void drainPersistQueue();
       candle = syn;
+    } else if (!candle && boundary < wallBoundary) {
+      // No active candle AND the tick's minute has already elapsed → it is a
+      // late tick, not the opening tick of the current minute. If a real
+      // finalized candle exists for it, merge; otherwise drop it rather than
+      // create a bogus flat active candle for a past minute.
+      const merged = mergeLateTickIntoFinalizedReal();
+      if (merged) return merged;
+      console.warn(`[MODULE1][AGGREGATOR] Late tick for ${symbol} (${timeframeStr}) minute ${new Date(boundary).toISOString()} with no candle to merge into — dropped (tickTime=${timestamp.toISOString()} wall=${new Date(wallBoundary).toISOString()}).`);
+      return {
+        symbol, timeframe: timeframeStr,
+        open: ltp, high: ltp, low: ltp, close: ltp,
+        openTime: boundary, volume, isSynthetic: false,
+      };
     } else {
-      // Initialize brand new real candle
+      // Initialize brand new real candle (opening tick of the current minute)
       candle = {
         symbol,
         timeframe: timeframeStr,
@@ -271,6 +341,7 @@ export const aggregateOHLC = async (tick: Tick, timeframeMinutes: number, timefr
         volume,
         isSynthetic: false,
       };
+      candleAudit.set(candle, { ticks: 1, prices: new Set([ltp]), first: ltp, last: ltp });
     }
   } else if (candle.openTime === boundary) {
     // Update existing active candle in the current boundary interval
@@ -279,6 +350,9 @@ export const aggregateOHLC = async (tick: Tick, timeframeMinutes: number, timefr
     candle.close = ltp;
     candle.volume += volume;
     candle.isSynthetic = false;
+    const a = candleAudit.get(candle);
+    if (a) { a.ticks += 1; a.prices.add(ltp); a.last = ltp; }
+    else candleAudit.set(candle, { ticks: 1, prices: new Set([ltp]), first: candle.open, last: ltp });
     if (syntheticIdx >= 0) {
       cachedList[syntheticIdx] = { ...candle };
     }
@@ -300,8 +374,12 @@ export const aggregateOHLC = async (tick: Tick, timeframeMinutes: number, timefr
       return syn;
     }
 
-    // Otherwise, this is a late tick for an already finalized real candle — do not corrupt current candle
-    console.warn(`[MODULE1][AGGREGATOR] Late/out-of-order tick for ${symbol} (${timeframeStr}): tickTime=${timestamp.toISOString()} boundary=${new Date(boundary).toISOString()} currentCandle=${new Date(candle.openTime).toISOString()}`);
+    // Late tick for an already-finalized REAL candle: extend its H/L if the
+    // trade was outside the captured range; never touch the active candle.
+    const merged = mergeLateTickIntoFinalizedReal();
+    if (merged) return merged;
+
+    console.warn(`[MODULE1][AGGREGATOR] Late/out-of-order tick for ${symbol} (${timeframeStr}): tickTime=${timestamp.toISOString()} boundary=${new Date(boundary).toISOString()} currentCandle=${new Date(candle.openTime).toISOString()} — no finalized candle to merge, dropped.`);
     return candle;
   }
 
@@ -377,6 +455,13 @@ const drainPersistQueue = async () => {
         if (!isMarketDataProcessingEnabled()) break;
         await FuturesOHLC.bulkWrite(batch.map(candleToUpsertOp), { ordered: false });
         console.log(`[MODULE1][PERSIST] Persisted ${batch.length} finalized candle(s) in one bulk write.`);
+        if (isOhlcAuditEnabled()) {
+          for (const c of batch) {
+            if (c.timeframe !== "1m" || (c.symbol !== "NIFTY-FUT" && c.symbol !== "NIFTY-SPOT")) continue;
+            const minuteIst = new Date(c.openTime).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: false });
+            auditLog(`[MODULE1][OHLC-AUDIT][PERSISTED] symbol=${c.symbol} minute=${minuteIst} persisted=${c.open}/${c.high}/${c.low}/${c.close} synthetic=${!!c.isSynthetic}`);
+          }
+        }
       } catch (error: any) {
         if (!isMarketDataProcessingEnabled()) break;
         // E11000 duplicate key: retry duplicate-key ops
@@ -449,15 +534,43 @@ const drainPersistQueue = async () => {
  */
 const finaliseCandle = async (liveCandle: Candle) => {
   if (!isMarketDataProcessingEnabled()) return;
-  const candle: Candle = { ...liveCandle };
+
+  // Diagnostic: emit the tick audit for this minute BEFORE the copy below
+  // (the WeakMap is keyed on the live object).
+  emitOhlcAuditLine(liveCandle);
+
+  let candle: Candle = { ...liveCandle };
   const { symbol, timeframe } = candle;
   if (!finalizedCandlesCache[symbol]) finalizedCandlesCache[symbol] = {};
   if (!finalizedCandlesCache[symbol][timeframe]) finalizedCandlesCache[symbol][timeframe] = [];
 
   const existingIdx = finalizedCandlesCache[symbol][timeframe].findIndex(c => c.openTime === candle.openTime);
   if (existingIdx >= 0) {
-    // If updating an existing synthetic candle with real candle or newer values, update it
-    finalizedCandlesCache[symbol][timeframe][existingIdx] = candle;
+    const existing = finalizedCandlesCache[symbol][timeframe][existingIdx];
+    if (!existing.isSynthetic && !candle.isSynthetic) {
+      // Both real: NEVER let a re-finalization shrink an already-captured
+      // candle (the classic "flat bar overwrites the good multi-tick bar"
+      // corruption). Merge conservatively — keep the original open, widen H/L,
+      // keep whichever close/volume is larger-range / non-decreasing.
+      const merged: Candle = {
+        ...existing,
+        open: existing.open,
+        high: Math.max(existing.high, candle.high),
+        low: Math.min(existing.low, candle.low),
+        close: candle.close,
+        volume: Math.max(existing.volume, candle.volume),
+        isSynthetic: false,
+      };
+      const changed = merged.high !== existing.high || merged.low !== existing.low || merged.close !== existing.close;
+      finalizedCandlesCache[symbol][timeframe][existingIdx] = merged;
+      candle = merged;
+      if (changed) {
+        console.log(`[MODULE1][AGGREGATOR] Re-finalization merged into existing real candle ${symbol} (${timeframe}) at ${new Date(candle.openTime).toISOString()} — O/H/L/C=${candle.open}/${candle.high}/${candle.low}/${candle.close}.`);
+      }
+    } else {
+      // Existing synthetic (or new real replacing synthetic) — replace outright.
+      finalizedCandlesCache[symbol][timeframe][existingIdx] = candle;
+    }
   } else {
     finalizedCandlesCache[symbol][timeframe].push(candle);
     // Keep at most 400 candles in memory (enough for a full 1m intraday session: 375 candles)
@@ -468,6 +581,39 @@ const finaliseCandle = async (liveCandle: Candle) => {
 
   persistQueue.push(candle);
   void drainPersistQueue();
+};
+
+/**
+ * [MODULE1][OHLC-AUDIT] — proves, per finalized 1-minute NIFTY-FUT / NIFTY-SPOT
+ * candle, whether a flat (O=H=L=C) bar was a genuine single-price minute or the
+ * result of ticks being lost between the pipeline and the aggregator.
+ * No-op unless MODULE1_OHLC_AUDIT=true.
+ */
+const emitOhlcAuditLine = (candle: Candle) => {
+  if (!isOhlcAuditEnabled()) return;
+  if (candle.timeframe !== "1m") return;
+  if (candle.symbol !== "NIFTY-FUT" && candle.symbol !== "NIFTY-SPOT") return;
+
+  const a = candleAudit.get(candle);
+  const pipe = getPipelineMinute(candle.symbol, candle.openTime);
+  const minuteIst = new Date(candle.openTime).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: false });
+  const flat = candle.open === candle.high && candle.high === candle.low && candle.low === candle.close;
+
+  let classification: string;
+  if (candle.isSynthetic) classification = "SYNTHETIC_NO_TICKS";
+  else if (!flat) classification = "OK_MULTI_TICK";
+  else if (pipe.pipelineTicks <= 1 && (a?.ticks ?? 1) <= 1) classification = "VALID_SINGLE_TICK";
+  else if (pipe.uniquePrices <= 1) classification = "VALID_MULTI_TICK_SAME_PRICE";
+  else classification = "INVALID_AGGREGATION"; // pipeline saw >1 distinct price but the candle is flat
+
+  auditLog(
+    `[MODULE1][OHLC-AUDIT] symbol=${candle.symbol} minute=${minuteIst} ` +
+    `pipelineTicks=${pipe.pipelineTicks} pipelineUniquePrices=${pipe.uniquePrices} ` +
+    `pipelineFirst=${pipe.firstPrice ?? "—"} pipelineLast=${pipe.lastPrice ?? "—"} ` +
+    `aggregatorTicks=${a?.ticks ?? "—"} aggregatorUniquePrices=${a ? a.prices.size : "—"} ` +
+    `aggregator=${candle.open}/${candle.high}/${candle.low}/${candle.close} ` +
+    `synthetic=${!!candle.isSynthetic} classification=${classification}`
+  );
 };
 
 /**

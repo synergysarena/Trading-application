@@ -250,6 +250,24 @@ export const useSocket = () => {
         }
       );
 
+      // Module 2 durable-persistence outcome for a finalized minute (diagnostic
+      // only — the live table above is never gated on this).
+      socket.on(
+        "tracker_persistence",
+        (data: { minute?: string; persisted?: boolean; failedStrikes?: string[] }) => {
+          if (!data?.minute) return;
+          useStore.getState().setLastTrackerPersistence({
+            minute: data.minute,
+            persisted: !!data.persisted,
+            failedStrikes: data.failedStrikes || [],
+            at: new Date().toISOString(),
+          });
+          if (data.persisted === false) {
+            console.warn(`[Module2/Socket] Minute ${data.minute} persistence FAILED for strikes: ${(data.failedStrikes || []).join(", ") || "all"}`);
+          }
+        }
+      );
+
       // Broker connection status from backend.
       socket.on("broker_status", (data: { status: string; moduleId?: string; detail?: string }) => {
         const mod = data.moduleId || "module1";

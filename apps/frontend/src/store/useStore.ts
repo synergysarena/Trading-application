@@ -88,9 +88,21 @@ interface AppState {
   // Module 2 Tracker Session State
   activeSession: Module2SessionData | null;
   setActiveSession: (session: Module2SessionData | null) => void;
+  /**
+   * Restores a session fetched from GET /session/current after a browser
+   * refresh / reconnect. Never downgrades a live in-memory session: if the
+   * same session is already loaded, the grid with more captured minutes per
+   * strike wins so live cells received since the fetch are not clobbered.
+   */
+  hydrateActiveSession: (session: Module2SessionData | null) => void;
   updateSessionStrikes: (strikes: string[]) => void;
   appendTrackerCell: (strike: string, cell: Module2Cell | null, stateUpdate: Partial<Module2StrikeState>) => void;
   updateFuturesOI: (futuresOI: any) => void;
+  // Last durable-persistence outcome for the active session's most recent
+  // finalized minute (from the `tracker_persistence` socket event). Diagnostic
+  // only — the live table never depends on this.
+  lastTrackerPersistence: { minute: string; persisted: boolean; failedStrikes: string[]; at: string } | null;
+  setLastTrackerPersistence: (p: AppState["lastTrackerPersistence"]) => void;
 }
 
 export const useStore = create<AppState>((set) => ({
@@ -188,6 +200,32 @@ export const useStore = create<AppState>((set) => ({
   // Module 2 Session State
   activeSession: null,
   setActiveSession: (session) => set({ activeSession: session }),
+  lastTrackerPersistence: null,
+  setLastTrackerPersistence: (p) => set({ lastTrackerPersistence: p }),
+  hydrateActiveSession: (session) =>
+    set((state) => {
+      if (!session) return {};
+      const current = state.activeSession;
+      if (!current || current.sessionId !== session.sessionId) {
+        return { activeSession: session };
+      }
+      // Same session already live — merge grids per strike, keeping whichever
+      // side has more cells for each strike so we never lose live updates.
+      const mergedStrikes: Record<string, Module2StrikeState> = { ...session.strikes };
+      for (const [strike, liveState] of Object.entries(current.strikes || {})) {
+        const serverState = session.strikes?.[strike];
+        const liveLen = liveState.grid?.length || 0;
+        const serverLen = serverState?.grid?.length || 0;
+        mergedStrikes[strike] = liveLen >= serverLen ? liveState : (serverState as Module2StrikeState);
+      }
+      return {
+        activeSession: {
+          ...session,
+          strikes: mergedStrikes,
+          futuresOI: current.futuresOI || session.futuresOI,
+        },
+      };
+    }),
   updateSessionStrikes: (strikes) =>
     set((state) => {
       if (!state.activeSession) return {};

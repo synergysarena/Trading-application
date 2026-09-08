@@ -68,6 +68,20 @@ export interface Module1Indicators {
 }
 
 // Module 2 Tracker Structures
+
+/**
+ * Where a rendered Strike Tracker minute cell came from. Diagnostic metadata
+ * only — the user-facing table renders `ltp` identically regardless.
+ *   "mongo" — restored from a durable module2striketicks document
+ *             (session start / refresh / backend recovery)
+ *   "live"  — a live Socket.IO tick / minute-boundary broadcast for the
+ *             current or just-completed minute
+ * A "live" cell is upgraded to "mongo" once its minute is durably persisted.
+ * There is deliberately no "redis" value — Redis/in-memory state must never
+ * become a historical cell.
+ */
+export type Module2CellSource = "mongo" | "live";
+
 export interface Module2Cell {
   ltp: number;
   minute: number; // minutes from 9:15 AM baseline, e.g., 0 for 9:15, 1 for 9:16
@@ -78,6 +92,10 @@ export interface Module2Cell {
   oiDelta?: number;
   oiBuy?: number;
   oiSell?: number;
+  /** Diagnostic provenance — see Module2CellSource. Optional & backward-compatible. */
+  source?: Module2CellSource;
+  /** True when this minute's persisted price was a placeholder (no legitimate tick). */
+  ltpMissing?: boolean;
 }
 
 export type TrendBadgeState = "H_TO_L" | "L_TO_H" | "FLAT" | "REVERSAL";
@@ -136,5 +154,5 @@ export interface UserSession {
 }
 
 export * from "./timeUtils";
-export { generateTimelineColumns, formatISTTime, normalizeCandleTimestamp, getISTMinuteBucket, getMinutesSinceMarketOpenIST } from "./timeUtils";
+export { generateTimelineColumns, formatISTTime, normalizeCandleTimestamp, getISTMinuteBucket, getMinutesSinceMarketOpenIST, floorToMinuteMs, getCanonicalMinuteDate } from "./timeUtils";
 

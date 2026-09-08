@@ -10,9 +10,31 @@ export interface NormalizedTimestamp {
   timeString: string;     // "HH:mm" in Asia/Kolkata (e.g. "13:39")
   minuteBucket: string;   // "YYYY-MM-DD HH:mm" in Asia/Kolkata (e.g. "2026-08-28 13:39")
   minuteIndex: number;    // Minutes elapsed since 09:15 AM IST (0 for 09:15 AM, 1 for 09:16 AM, etc.)
-  timestampMs: number;    // UTC epoch milliseconds
+  timestampMs: number;    // UTC epoch milliseconds (raw, NOT floored)
+  minuteStartMs: number;  // UTC epoch milliseconds floored to the start of the clock minute
   fullIso: string;        // UTC ISO string (e.g. "2026-08-28T08:09:00.000Z")
 }
+
+/**
+ * Floors any timestamp to the start of its clock minute, returned as UTC epoch ms.
+ * Epoch ms is aligned to UTC minute boundaries, so `ms - (ms % 60000)` is the
+ * canonical minute start (identical result to `new Date(x).setSeconds(0, 0)`).
+ * Use this — never a raw `Date.now()` — for every Strike Tracker minute key so
+ * the { session_id, strike, minute_timestamp } unique index actually protects
+ * one logical minute.
+ */
+export const floorToMinuteMs = (timestamp?: Date | string | number | null): number => {
+  const ms = toTimestampMs(timestamp);
+  return ms - (((ms % 60000) + 60000) % 60000);
+};
+
+/**
+ * Canonical minute-boundary Date (UTC, seconds & milliseconds zeroed).
+ * This is THE representation persisted to `module2striketicks.minute_timestamp`
+ * and used as the idempotency key for upserts.
+ */
+export const getCanonicalMinuteDate = (timestamp?: Date | string | number | null): Date =>
+  new Date(floorToMinuteMs(timestamp));
 
 const IST_TIMEZONE = "Asia/Kolkata";
 
@@ -109,6 +131,7 @@ export const normalizeCandleTimestamp = (timestamp?: Date | string | number | nu
     minuteBucket: getISTMinuteBucket(ms),
     minuteIndex: getMinutesSinceMarketOpenIST(ms),
     timestampMs: ms,
+    minuteStartMs: floorToMinuteMs(ms),
     fullIso: d.toISOString(),
   };
 };
