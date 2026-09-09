@@ -15,7 +15,7 @@ const MASTER_URLS: Record<string, string> = {
 const DOWNLOAD_TIMEOUT_MS = 30_000;
 const CACHE_TTL_MS = 4 * 60 * 60 * 1000; // 4 hours — covers weekly expiry cycles
 
-interface MasterRow {
+export interface MasterRow {
   exchange: string;
   token: string;
   symbol: string;
@@ -40,6 +40,22 @@ export interface ActiveInstrumentTokens {
 
 let cachedTokens: ActiveInstrumentTokens | null = null;
 let lastFetchTime = 0;
+
+/**
+ * Module 1 subscribes to (and therefore STORES) the COMPLETE nearest-expiry
+ * NIFTY option chain — every OPTIDX contract for that expiry that exists in the
+ * broker's instrument master — NOT an ATM band. The frontend Call/Put strike
+ * selection is a display choice only; it never scopes what the backend stores.
+ *
+ * `MODULE1_OPTION_STRIKE_RADIUS` is an ops-only safety valve (points from ATM)
+ * for the rare case the broker WS can't sustain the full chain. Unset / 0 /
+ * non-numeric ⇒ Infinity ⇒ the full universe (the required default). It is NOT
+ * a product feature and defaults to "no limit".
+ */
+export const getOptionStrikeRadius = (): number => {
+  const raw = Number(process.env.MODULE1_OPTION_STRIKE_RADIUS);
+  return Number.isFinite(raw) && raw > 0 ? raw : Infinity;
+};
 
 // Raw NFO rows + nearest option expiry from the last successful refresh, kept around so
 // on-demand lookups (exact strike resolution, ATM-band recompute, and every dropdown query
@@ -182,19 +198,23 @@ const findNearestOptionExpiry = (rows: MasterRow[]): Date | null => {
 };
 
 /**
- * Selects CE/PE tokens for the given expiry within `strikeRadius` of `atmStrike`.
- * Shared by the startup token build (buildActiveTokens) and the on-demand ATM-band
- * recompute (recomputeOptionBandFromLivePrice) so both use identical selection logic.
+ * Selects CE/PE tokens for the given expiry.
+ *
+ * Module 1 requirement: the COMPLETE option chain for `nearestExpiry` is
+ * subscribed and stored. `strikeRadius` defaults to Infinity (every strike);
+ * a finite value is only ever passed from the `MODULE1_OPTION_STRIKE_RADIUS`
+ * ops safety valve (see getOptionStrikeRadius). When it is Infinity the
+ * `atmStrike` argument has no effect on selection — it is used only to centre
+ * the diagnostic log.
  *
  * NIFTY-specific by design — this powers the live spot/futures/option WEBSOCKET
- * SUBSCRIPTION band, not the discovery dropdowns below, and is out of scope for the
- * multi-exchange dropdown refactor (subscriptions must not change).
+ * SUBSCRIPTION set, not the discovery dropdowns below.
  */
-const selectOptionTokens = (
+export const selectOptionTokens = (
   rows: MasterRow[],
   nearestExpiry: Date,
   atmStrike: number,
-  strikeRadius: number
+  strikeRadius: number = Infinity
 ): { ceTokens: string[]; peTokens: string[]; expiryStr: string } => {
   const atmRounded = Math.round(atmStrike / 50) * 50;
   const expiryStr = formatExpiryForSymbol(nearestExpiry);
@@ -203,7 +223,9 @@ const selectOptionTokens = (
     if (r.symbol !== "NIFTY" || r.instrumentType !== "OPTIDX" || !r.expiry) return false;
     const d = new Date(r.expiry);
     d.setUTCHours(0, 0, 0, 0);
-    return d.getTime() === nearestExpiry.getTime() && Math.abs(r.strike - atmRounded) <= strikeRadius;
+    if (d.getTime() !== nearestExpiry.getTime()) return false;
+    // Infinity ⇒ whole chain (the default). Finite ⇒ ops-only ATM band.
+    return !Number.isFinite(strikeRadius) || Math.abs(r.strike - atmRounded) <= strikeRadius;
   });
 
   const ceTokens = strikeRows
@@ -219,10 +241,9 @@ const selectOptionTokens = (
   return { ceTokens, peTokens, expiryStr };
 };
 
-/** NIFTY-specific live-subscription token build — unchanged by the multi-exchange
- *  discovery refactor; still filters `rows` down to NIFTY FUTIDX/OPTIDX itself,
- *  so broadening what's in `rows` doesn't change its output. */
-const buildActiveTokens = (rows: MasterRow[], atmStrike: number, atmIsReliable: boolean): ActiveInstrumentTokens => {
+/** NIFTY-specific live-subscription token build — filters `rows` down to NIFTY
+ *  FUTIDX + the COMPLETE nearest-expiry OPTIDX chain (no ATM band). */
+export const buildActiveTokens = (rows: MasterRow[], atmStrike: number, atmIsReliable: boolean): ActiveInstrumentTokens => {
   const today = new Date();
   today.setUTCHours(0, 0, 0, 0);
 
@@ -251,10 +272,35 @@ const buildActiveTokens = (rows: MasterRow[], atmStrike: number, atmIsReliable: 
   const nearestOptionExpiry = nearestExpiry.toISOString().slice(0, 10);
   console.log(`[InstrumentTokens] Nearest option expiry: ${nearestOptionExpiry}`);
 
-  const strikeRadius = atmIsReliable ? 1000 : 5000;
+  // Full nearest-expiry NIFTY option universe present in the master (diagnostic).
+  const universeRows = rows.filter(r => {
+    if (r.symbol !== "NIFTY" || r.instrumentType !== "OPTIDX" || !r.expiry) return false;
+    const d = new Date(r.expiry); d.setUTCHours(0, 0, 0, 0);
+    return d.getTime() === nearestExpiry.getTime();
+  });
+  const universeCe = universeRows.filter(r => r.optionType === "CE").length;
+  const universePe = universeRows.filter(r => r.optionType === "PE").length;
+
+  const strikeRadius = getOptionStrikeRadius();
   const { ceTokens, peTokens } = selectOptionTokens(rows, nearestExpiry, atmStrike, strikeRadius);
 
-  console.log(`[InstrumentTokens] ATM=${Math.round(atmStrike / 50) * 50} (reliable=${atmIsReliable}, radius=${strikeRadius}): ${ceTokens.length} CE + ${peTokens.length} PE tokens selected.`);
+  const limitNote = Number.isFinite(strikeRadius)
+    ? `ATM band ±${strikeRadius} (MODULE1_OPTION_STRIKE_RADIUS ops override active)`
+    : "FULL option universe (no ATM band)";
+  console.log(
+    `[InstrumentTokens] Module 1 NIFTY option universe discovered (expiry ${nearestOptionExpiry}): ` +
+    `${universeCe} CE + ${universePe} PE = ${universeCe + universePe} contracts.`
+  );
+  console.log(
+    `[InstrumentTokens] Module 1 NIFTY option tokens subscribed: ${ceTokens.length} CE + ${peTokens.length} PE ` +
+    `= ${ceTokens.length + peTokens.length} (${limitNote}).`
+  );
+  if (Number.isFinite(strikeRadius) && (ceTokens.length < universeCe || peTokens.length < universePe)) {
+    console.warn(
+      `[InstrumentTokens] NOTE: ${universeCe + universePe - ceTokens.length - peTokens.length} contract(s) ` +
+      `excluded by the MODULE1_OPTION_STRIKE_RADIUS ops override — unset it to store the full chain.`
+    );
+  }
 
   return { futToken, ceTokens, peTokens, fetchedAt: new Date(), nearestOptionExpiry, futExpiry, atmIsReliable };
 };
@@ -484,7 +530,7 @@ export const recomputeOptionBandFromLivePrice = (
   livePrice: number
 ): { ceTokens: string[]; peTokens: string[] } | null => {
   if (!cachedRows.length || !cachedNearestExpiry) return null;
-  const { ceTokens, peTokens } = selectOptionTokens(cachedRows, cachedNearestExpiry, livePrice, 1000);
-  console.log(`[InstrumentTokens] Recomputed ATM band from live price ${livePrice} → ${ceTokens.length} CE + ${peTokens.length} PE tokens (±1000, expiry=${cachedNearestExpiry.toISOString().slice(0, 10)}).`);
+  const { ceTokens, peTokens } = selectOptionTokens(cachedRows, cachedNearestExpiry, livePrice, getOptionStrikeRadius());
+  console.log(`[InstrumentTokens] Recomputed option chain from live price ${livePrice} → ${ceTokens.length} CE + ${peTokens.length} PE tokens (expiry=${cachedNearestExpiry.toISOString().slice(0, 10)}).`);
   return { ceTokens, peTokens };
 };

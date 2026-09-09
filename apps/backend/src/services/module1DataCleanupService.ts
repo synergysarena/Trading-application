@@ -1,5 +1,6 @@
 import { FuturesOHLC } from "../models/FuturesOHLC";
 import { PivotLevels as PivotLevelsModel } from "../models/PivotLevels";
+import { mongoConnectionStateName } from "../config/db";
 
 // ── Module 1 end-of-day storage cleanup ───────────────────────────────────────
 //
@@ -81,9 +82,19 @@ export const cleanupPreviousModule1SessionData = async (): Promise<{
   }
 
   lastCleanedSessionOpenMs = sessionOpenMs;
+
+  // Diagnostic: how much CURRENT-session data survived the cutoff. If these are
+  // 0 during market hours, the data loss is upstream (persistence), not here —
+  // this delete filter is strictly `< today's session open` and cannot touch it.
+  let futuresSurviving = -1;
+  let pivotsSurviving = -1;
+  try { futuresSurviving = await FuturesOHLC.countDocuments({ bar_time: { $gte: cutoff } }); } catch { /* best-effort */ }
+  try { pivotsSurviving = await PivotLevelsModel.countDocuments({ computed_at: { $gte: cutoff } }); } catch { /* best-effort */ }
+
   console.log(
-    `[Module1Cleanup] Purged previous-session Module 1 market data (cutoff=${cutoff.toISOString()}) — ` +
-    `FuturesOHLC: ${futuresOHLCDeleted} removed, PivotLevels: ${pivotLevelsDeleted} removed.`
+    `[Module1Cleanup] Purged previous-session Module 1 market data (cutoff=${cutoff.toISOString()}, now=${new Date().toISOString()}, mongo=${mongoConnectionStateName()}) — ` +
+    `FuturesOHLC: ${futuresOHLCDeleted} removed / ${futuresSurviving} kept (>= cutoff), ` +
+    `PivotLevels: ${pivotLevelsDeleted} removed / ${pivotsSurviving} kept (>= cutoff).`
   );
 
   return { sessionOpenMs, futuresOHLCDeleted, pivotLevelsDeleted };

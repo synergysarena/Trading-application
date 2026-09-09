@@ -1,6 +1,8 @@
 import { Module1CandleArchive } from "../models/Module1CandleArchive";
 import { FuturesOHLC } from "../models/FuturesOHLC";
 import { Candle } from "@stock/shared";
+import { isOhlcAuditEnabled, auditLog } from "./module1OhlcAudit";
+import { mongoConnectionStateName } from "../config/db";
 
 /**
  * Returns YYYY-MM-DD in IST timezone for a given timestamp/Date.
@@ -16,9 +18,19 @@ export const getIstTradingDateStr = (ts: number | Date = Date.now()): string => 
   return `${get("year")}-${get("month")}-${get("day")}`;
 };
 
+// Test seam: lets a regression test substitute the Mongo write without a DB.
+let _archiveWriter: ((ops: any[]) => Promise<any>) | null = null;
+export const __setArchiveWriterForTest = (fn: ((ops: any[]) => Promise<any>) | null): void => {
+  _archiveWriter = fn;
+};
+
 /**
- * Asynchronously archives finalized Module 1 candles into Module1CandleArchive.
- * Fire-and-forget, non-blocking for live tick processing.
+ * Archives finalized Module 1 candles into Module1CandleArchive.
+ *
+ * Phase 2: this is now awaited inside the candle-persistence retry wrapper
+ * (ohlcAggregator.persistCandleBatch), so a TRANSIENT failure must propagate
+ * (throw) to trigger the caller's bounded retry/requeue. A pure duplicate-key
+ * race is still swallowed here — those documents are already persisted.
  */
 export const archiveModule1Candles = async (candles: Candle[]): Promise<void> => {
   if (!candles || candles.length === 0) return;
@@ -53,12 +65,24 @@ export const archiveModule1Candles = async (candles: Candle[]): Promise<void> =>
   });
 
   try {
-    await Module1CandleArchive.bulkWrite(ops, { ordered: false });
-  } catch (error: any) {
-    // Duplicate key exceptions on concurrent upsert race can be safely swallowed or logged
-    if (error?.code !== 11000 && !error?.writeErrors?.every((w: any) => w.code === 11000)) {
-      console.warn("[Module1Archive] Bulk archive write warning:", error?.message || error);
+    const res: any = _archiveWriter
+      ? await _archiveWriter(ops)
+      : await Module1CandleArchive.bulkWrite(ops, { ordered: false });
+    if (isOhlcAuditEnabled()) {
+      auditLog(
+        `[MODULE1][OHLC-AUDIT][ARCHIVE-RESULT] ops=${ops.length} ` +
+        `upserted=${res?.upsertedCount ?? "?"} modified=${res?.modifiedCount ?? "?"} ` +
+        `matched=${res?.matchedCount ?? "?"} mongo=${mongoConnectionStateName()}`
+      );
     }
+  } catch (error: any) {
+    const allDup = error?.code === 11000 || error?.writeErrors?.every((w: any) => w.code === 11000);
+    if (allDup) return; // documents already present — nothing to retry
+    console.warn(`[Module1Archive] Bulk archive write failed (mongo=${mongoConnectionStateName()}):`, error?.message || error);
+    if (isOhlcAuditEnabled()) {
+      auditLog(`[MODULE1][OHLC-AUDIT][ARCHIVE-FAIL] ops=${ops.length} mongo=${mongoConnectionStateName()} err=${error?.message || error}`);
+    }
+    throw error; // propagate transient failures to the retry wrapper
   }
 };
 

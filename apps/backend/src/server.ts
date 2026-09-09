@@ -14,6 +14,7 @@ import { runStartupCheck } from "./utils/startupCheck";
 
 import { connectDB } from "./config/db";
 import { ensureUniqueCandleIndex } from "./models/FuturesOHLC";
+import { ensurePivotIndexes } from "./models/PivotLevels";
 import { cleanupPreviousModule1SessionData, startModule1DailyCleanupScheduler } from "./services/module1DataCleanupService";
 import redis from "./config/redis";
 import { sweepLegacyMarketKeys } from "./services/redisWriteBuffer";
@@ -23,7 +24,8 @@ import trackerRouter from "./routes/tracker";
 import module2Router from "./routes/module2";
 import systemRouter from "./routes/system";
 import { getZebuOAuthStatusEndpoint, zebuOAuthCallback } from "./controllers/zebuOAuth";
-import { initPivotService } from "./services/pivotService";
+import { initPivotService, stopPivotWorker } from "./services/pivotService";
+import { startModule1PersistHealthLogger, stopModule1PersistHealthLogger } from "./services/module1PersistHealth";
 import { initSocketServer } from "./services/socketService";
 import { initTrackerEngine, stopTrackerEngine, getModule2RuntimeStats } from "./services/trackerService";
 import { flushPendingPersistence } from "./services/module2PersistenceService";
@@ -266,6 +268,13 @@ const startServer = async () => {
     } catch (error: any) {
       console.error("[Server] Candle index sync failed (will retry on next restart):", error?.message || error);
     }
+    // Phase 2.1: pivot dedup + unique-index build is BACKGROUND DB maintenance,
+    // NOT a startup gate. It used to be awaited here and — on a large legacy
+    // `pivotlevels` collection (~97k docs/session) — blocked `server.listen()`
+    // for minutes because its dedup did one sequential deleteMany per duplicate
+    // key. It is now kicked off after the HTTP server is already listening (see
+    // the server.listen callback below); ensurePivotIndexes() is idempotent and
+    // the single-writer upsert path is correct with or without the index.
     try {
       // Storage-lifecycle requirement: MongoDB must hold ONLY the current
       // trading session's Module 1 market data. Purge everything from before
@@ -356,6 +365,7 @@ const startServer = async () => {
 
   // ── Step 4: Start monitoring ──────────────────────────────────────────────
   startMonitoringLoop();
+  startModule1PersistHealthLogger();
 
   // ── Step 5: Start HTTP + WebSocket server ────────────────────────────────
   server.listen(PORT, () => {
@@ -364,6 +374,17 @@ const startServer = async () => {
     );
     console.log("[Server] Broker data feeds will start after user authentication.");
     console.log(`[Server] CORS origin: ${process.env.FRONTEND_URL || "dynamic (credentials supported)"}`);
+
+    // Phase 2.1: run the pivot dedup + unique-index maintenance in the
+    // background now that the HTTP server is accepting connections. On a large
+    // legacy collection this can take tens of seconds — it must never delay
+    // (or, on Render, fail the health check for) the listen.
+    if (dbReady) {
+      console.log("[Server] Pivot index maintenance scheduled (background).");
+      void ensurePivotIndexes().catch((e: any) =>
+        console.error("[Server] Background pivot index maintenance failed:", e?.message || e)
+      );
+    }
   });
 
   // ── NOTE: Broker authentication is NOT performed here ────────────────────
@@ -387,6 +408,8 @@ const shutdown = (signal: string) => {
   server.close(async () => {
     console.log("[Server] HTTP server closed.");
     stopMonitoringLoop();
+    stopModule1PersistHealthLogger();
+    stopPivotWorker();
     stopSessionManager();
     stopDataFeed(true);
 

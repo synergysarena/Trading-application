@@ -4,6 +4,7 @@ import { readLive } from "./redisWriteBuffer";
 import { archiveModule1Candles } from "./module1ArchiveService";
 import { isMarketDataProcessingEnabled } from "./marketDataLifecycle";
 import { isOhlcAuditEnabled, auditLog, getPipelineMinute } from "./module1OhlcAudit";
+import { mongoConnectionStateName } from "../config/db";
 
 /**
  * Grace period applied to TIMER-based (proactive) candle finalization only.
@@ -112,33 +113,59 @@ export const startBoundaryChecker = () => {
       }
     }
 
-    // 2. Continuity check for NIFTY-SPOT and NIFTY-FUT:
-    // If a minute has elapsed with NO ticks received, create a synthetic carry-forward candle.
-    for (const symbol of CONTINUOUS_SYMBOLS) {
+    // 2. Continuity check for NIFTY-SPOT and NIFTY-FUT: fill every elapsed
+    //    minute that received no ticks with a synthetic carry-forward candle.
+    await fillContinuityCandles(now, sessionOpenMs);
+  }, 1000);
+};
+
+/**
+ * Guarantees a GAP-FREE FUT/SPOT candle timeline: for each continuous symbol /
+ * timeframe, fills every boundary between the most recent existing candle and
+ * `prevBoundary` (one before the current forming minute) that has no candle
+ * with a flat carry-forward synthetic bar.
+ *
+ * Previously this only ever considered the single boundary immediately before
+ * now, and it bailed whenever ANY active candle existed — so a zero-tick minute
+ * whose successor got its first tick before the 1s checker ran was skipped
+ * forever, leaving a permanent hole that surfaced as a missing worksheet row.
+ *
+ * Exported for deterministic testing (see test_module1_timeline_continuity.ts).
+ */
+export const fillContinuityCandles = async (now: number, sessionOpenMs: number): Promise<void> => {
+  for (const symbol of CONTINUOUS_SYMBOLS) {
+    if (!isMarketDataProcessingEnabled()) return;
+    for (const tfStr of CONTINUITY_TIMEFRAMES) {
+      const prevClose = lastKnownClose[symbol]?.[tfStr];
+      if (prevClose === undefined || prevClose <= 0) continue;
+
+      const tfMins = await getTimeframeMinutes(tfStr);
       if (!isMarketDataProcessingEnabled()) return;
-      for (const tfStr of CONTINUITY_TIMEFRAMES) {
-        const prevClose = lastKnownClose[symbol]?.[tfStr];
-        if (prevClose === undefined || prevClose <= 0) continue;
 
-        const tfMins = await getTimeframeMinutes(tfStr);
-        if (!isMarketDataProcessingEnabled()) return;
+      const tfMs = tfMins * 60000;
+      const currentBoundary = getBoundaryTime(new Date(now), tfMins);
+      const prevBoundary = currentBoundary - tfMs;
 
-        const currentBoundary = getBoundaryTime(new Date(now), tfMins);
-        const prevBoundary = currentBoundary - tfMins * 60000;
+      // Only create carry-forward bars within the current trading session
+      if (prevBoundary < sessionOpenMs) continue;
 
-        // Only create carry-forward bars within the current trading session
-        if (prevBoundary < sessionOpenMs) continue;
+      const cachedList = finalizedCandlesCache[symbol]?.[tfStr] || [];
+      const active = activeCandles[symbol]?.[tfStr];
 
-        // Check if an active candle exists for prevBoundary or currentBoundary
-        const active = activeCandles[symbol]?.[tfStr];
-        if (active && active.openTime >= prevBoundary) continue;
+      // Most recent boundary that already has a candle (finalized OR active).
+      let lastCovered = -1;
+      for (const c of cachedList) if (c.openTime > lastCovered) lastCovered = c.openTime;
+      if (active && active.openTime > lastCovered) lastCovered = active.openTime;
+      if (lastCovered < 0) continue; // no real tick yet — nothing to carry forward
 
-        // Check if a finalized candle already exists for prevBoundary
-        const cachedList = finalizedCandlesCache[symbol]?.[tfStr] || [];
-        const hasFinalized = cachedList.some(c => c.openTime === prevBoundary);
-        if (hasFinalized) continue;
+      // Fill EVERY empty boundary from there through prevBoundary. Bounded per
+      // pass so a long stall recovers over a few ticks, not one large burst.
+      const finalizedSet = new Set(cachedList.map(c => c.openTime));
+      let filled = 0;
+      for (let b = Math.max(lastCovered + tfMs, sessionOpenMs); b <= prevBoundary && filled < 30; b += tfMs) {
+        if (finalizedSet.has(b)) continue;
+        if (active && active.openTime === b) continue;
 
-        // No active candle and no finalized candle for prevBoundary -> generate synthetic carry-forward candle
         const syntheticCandle: Candle = {
           symbol,
           timeframe: tfStr,
@@ -146,16 +173,17 @@ export const startBoundaryChecker = () => {
           high: prevClose,
           low: prevClose,
           close: prevClose,
-          openTime: prevBoundary,
+          openTime: b,
           volume: 0,
           isSynthetic: true,
         };
 
-        console.log(`[MODULE1][BOUNDARY] Generated synthetic carry-forward candle for ${symbol} (${tfStr}) at ${new Date(prevBoundary).toISOString()} (close=${prevClose}).`);
+        console.log(`[MODULE1][BOUNDARY] Generated synthetic carry-forward candle for ${symbol} (${tfStr}) at ${new Date(b).toISOString()} (close=${prevClose}).`);
         await finaliseCandle(syntheticCandle);
+        filled++;
       }
     }
-  }, 1000);
+  }
 };
 
 export const stopBoundaryChecker = () => {
@@ -290,8 +318,7 @@ export const aggregateOHLC = async (tick: Tick, timeframeMinutes: number, timefr
     fin.low = newLow;
     fin.volume += volume;
     console.log(`[MODULE1][AGGREGATOR] Late real tick merged into finalized ${symbol} (${timeframeStr}) at ${new Date(boundary).toISOString()} — H/L extended to ${fin.high}/${fin.low}.`);
-    persistQueue.push({ ...fin });
-    void drainPersistQueue();
+    queueForPersist({ ...fin });
     return fin;
   };
 
@@ -312,8 +339,7 @@ export const aggregateOHLC = async (tick: Tick, timeframeMinutes: number, timefr
       syn.isSynthetic = false;
       console.log(`[MODULE1][AGGREGATOR] Real tick arrived for synthetic candle ${symbol} (${timeframeStr}) at ${new Date(boundary).toISOString()} — replaced synthetic bar.`);
       candleAudit.set(syn, { ticks: 1, prices: new Set([ltp]), first: ltp, last: ltp });
-      persistQueue.push({ ...syn });
-      void drainPersistQueue();
+      queueForPersist({ ...syn });
       candle = syn;
     } else if (!candle && boundary < wallBoundary) {
       // No active candle AND the tick's minute has already elapsed → it is a
@@ -369,8 +395,7 @@ export const aggregateOHLC = async (tick: Tick, timeframeMinutes: number, timefr
       syn.volume = volume;
       syn.isSynthetic = false;
       console.log(`[MODULE1][AGGREGATOR] Late real tick arrived for synthetic candle ${symbol} (${timeframeStr}) at ${new Date(boundary).toISOString()} — replaced synthetic bar.`);
-      persistQueue.push({ ...syn });
-      void drainPersistQueue();
+      queueForPersist({ ...syn });
       return syn;
     }
 
@@ -397,14 +422,78 @@ export const aggregateOHLC = async (tick: Tick, timeframeMinutes: number, timefr
   return candle;
 };
 
-// ── Phase 6: persistence moved off the tick hot path ─────────────────────────
-const persistQueue: Candle[] = [];
+// ── Phase 6/2: candle persistence — off the tick hot path AND decoupled from
+//    pivot processing ─────────────────────────────────────────────────────────
+//
+// Phase 1 proved this was THE production bottleneck: drainPersistQueue used to
+//   (a) splice the WHOLE queue into one unbounded batch,
+//   (b) run a per-(symbol,timeframe) retention deleteMany (~4,560 awaited round
+//       trips on the first session-start burst),
+//   (c) then, still inside the same loop, AWAIT onCandleFinalized() → 3 pivot
+//       inserts per real 1m/3m/5m candle (~1,000–2,100 sequential Mongo writes
+//       per minute for the 456-instrument universe).
+// The pipe fell 60–420s behind, the event loop starved, the Zebu WS dropped,
+// and OOM restarts discarded every queued-but-unwritten candle → whole-minute
+// blackouts for every symbol at once.
+//
+// Now:
+//   • the batch is BOUNDED (MAX_PERSIST_BATCH) and the loop yields between
+//     batches, so a burst is a series of small units of work, not one block.
+//   • FuturesOHLC + Module1CandleArchive are the ONLY awaited writes here, and
+//     a transient failure RE-QUEUES the batch with exponential backoff instead
+//     of dropping it. Exhausted/permanent failures go to a bounded dead-letter
+//     (kept in finalizedCandlesCache + logged loudly — never silently lost).
+//   • retention is NOT done here — the bar_time TTL index (86,400s) and
+//     module1DataCleanupService (boot + 5-min scheduler) both cover it.
+//   • pivots are ENQUEUED (fire-and-forget, O(1)) onto pivotService's bounded
+//     worker. If pivots fall behind, candle persistence is unaffected.
+
+interface PersistItem { candle: Candle; at: number; attempts: number }
+
+const persistQueue: PersistItem[] = [];
 let draining = false;
-const prunedSessions = new Map<string, number>();
-const HISTORY_RETENTION_MS = 24 * 60 * 60 * 1000;
+let persistBackoffUntil = 0;
+let _retryScheduled = false;
+
+const MAX_PERSIST_BATCH = Number(process.env.MODULE1_PERSIST_BATCH_MAX) || 800;
+const MAX_PERSIST_ATTEMPTS = Number(process.env.MODULE1_PERSIST_MAX_ATTEMPTS) || 8;
+const DEAD_LETTER_MAX = 5000;
+
+// Candles that exhausted MAX_PERSIST_ATTEMPTS or hit a permanent (schema/
+// validation) error. Bounded + loudly logged so a permanent failure is never
+// silently discarded; each also stays in finalizedCandlesCache and is still
+// served by the API's in-memory fallback.
+const persistDeadLetter: Candle[] = [];
 
 let _persistErrCount = 0;
 let _persistErrLastLog = 0;
+let _persistOkCount = 0;
+let _lastBatchSize = 0;
+let _lastWriteMs = 0;
+let _permanentFailureCount = 0;
+
+export const getModule1PersistStats = () => ({
+  queueDepth: persistQueue.length,
+  oldestQueuedAgeMs: persistQueue.length > 0 ? Date.now() - persistQueue[0].at : 0,
+  lastBatchSize: _lastBatchSize,
+  lastWriteMs: _lastWriteMs,
+  persisted: _persistOkCount,
+  retryCount: _persistErrCount,
+  permanentFailures: _permanentFailureCount,
+  deadLetterSize: persistDeadLetter.length,
+  backoffMs: Math.max(0, persistBackoffUntil - Date.now()),
+  draining,
+});
+
+/** Test-only: reset all persistence counters + queues. */
+export const __resetPersistForTest = (): void => {
+  persistQueue.length = 0;
+  persistDeadLetter.length = 0;
+  draining = false;
+  persistBackoffUntil = 0;
+  _retryScheduled = false;
+  _persistErrCount = _persistOkCount = _lastBatchSize = _lastWriteMs = _permanentFailureCount = 0;
+};
 
 // Single source of truth for the candle upsert op — includes is_synthetic
 const candleToUpsertOp = (c: Candle) => ({
@@ -424,108 +513,169 @@ const candleToUpsertOp = (c: Candle) => ({
   },
 });
 
-const sessionOpenForCandle = (openTimeMs: number): number => {
-  const sessionOpen = new Date(openTimeMs);
-  sessionOpen.setUTCHours(3, 45, 0, 0); // 09:15 IST
-  if (sessionOpen.getTime() > openTimeMs) {
-    sessionOpen.setUTCDate(sessionOpen.getUTCDate() - 1);
+// Test seam: substitute the Mongo candle write (FuturesOHLC + Archive) without a DB.
+let _candleBatchWriter: ((batch: Candle[]) => Promise<void>) | null = null;
+export const __setCandleBatchWriterForTest = (fn: ((batch: Candle[]) => Promise<void>) | null): void => {
+  _candleBatchWriter = fn;
+};
+
+// A schema/validation/cast error is permanent — retrying it forever is pointless.
+// Everything else (network, timeout, pool exhaustion, primary step-down) is transient.
+const isTransientWriteError = (err: any): boolean => {
+  const name = String(err?.name || "");
+  if (name === "ValidationError" || name === "StrictModeError" || name === "CastError") return false;
+  return true;
+};
+
+/** Persist one batch to FuturesOHLC + Module1CandleArchive. Throws on failure
+ *  (idempotent upserts — a retried batch is harmless). */
+const writeCandleBatch = async (batch: Candle[]): Promise<void> => {
+  if (_candleBatchWriter) { await _candleBatchWriter(batch); return; }
+  const realBatch = batch.filter(c => !c.isSynthetic);
+  if (realBatch.length > 0) await archiveModule1Candles(realBatch);
+  const bulkRes: any = await FuturesOHLC.bulkWrite(batch.map(candleToUpsertOp), { ordered: false });
+  if (isOhlcAuditEnabled()) {
+    auditLog(
+      `[MODULE1][OHLC-AUDIT][PERSIST-RESULT] batch=${batch.length} ` +
+      `upserted=${bulkRes?.upsertedCount ?? "?"} modified=${bulkRes?.modifiedCount ?? "?"} ` +
+      `matched=${bulkRes?.matchedCount ?? "?"} mongo=${mongoConnectionStateName()}`
+    );
+    for (const c of batch) {
+      if (c.timeframe !== "1m" || (c.symbol !== "NIFTY-FUT" && c.symbol !== "NIFTY-SPOT")) continue;
+      const minuteIst = new Date(c.openTime).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: false });
+      auditLog(`[MODULE1][OHLC-AUDIT][PERSISTED] symbol=${c.symbol} minute=${minuteIst} persisted=${c.open}/${c.high}/${c.low}/${c.close} synthetic=${!!c.isSynthetic}`);
+    }
   }
-  return sessionOpen.getTime();
+};
+
+const scheduleDrainRetry = (delayMs: number): void => {
+  if (_retryScheduled) return;
+  _retryScheduled = true;
+  setTimeout(() => { _retryScheduled = false; void drainPersistQueue(); }, Math.max(0, delayMs));
+};
+
+/** Hand a persisted batch's real candles to the bounded pivot worker. O(1) per
+ *  candle, never awaited, never allowed to affect persistence. */
+const enqueuePivotsFor = (batch: Candle[]): void => {
+  if (!onCandleFinalized || !isMarketDataProcessingEnabled()) return;
+  for (const c of batch) {
+    if (c.isSynthetic) continue;
+    try {
+      void onCandleFinalized(c);
+    } catch {
+      /* pivot enqueue must never break candle persistence */
+    }
+  }
 };
 
 const drainPersistQueue = async () => {
   if (draining || !isMarketDataProcessingEnabled()) return;
+  if (Date.now() < persistBackoffUntil) {
+    scheduleDrainRetry(persistBackoffUntil - Date.now());
+    return;
+  }
   draining = true;
   try {
     while (persistQueue.length > 0) {
-      if (!isMarketDataProcessingEnabled()) {
-        persistQueue.length = 0;
+      if (!isMarketDataProcessingEnabled()) { persistQueue.length = 0; break; }
+
+      const items = persistQueue.slice(0, MAX_PERSIST_BATCH);
+      const batch = items.map(i => i.candle);
+      _lastBatchSize = batch.length;
+
+      const t0 = Date.now();
+      try {
+        await writeCandleBatch(batch);
+        _lastWriteMs = Date.now() - t0;
+        persistQueue.splice(0, items.length);
+        _persistOkCount += batch.length;
+        console.log(`[MODULE1][PERSIST] Persisted ${batch.length} candle(s) (${_lastWriteMs}ms, queue=${persistQueue.length}).`);
+        enqueuePivotsFor(batch);
+      } catch (error: any) {
+        _lastWriteMs = Date.now() - t0;
+        const writeErrors: any[] = error?.writeErrors ?? [];
+        const allDup =
+          error?.code === 11000 ||
+          (writeErrors.length > 0 && writeErrors.every((we: any) => we?.code === 11000));
+
+        if (allDup) {
+          // Every op was a duplicate key → the documents are already persisted.
+          persistQueue.splice(0, items.length);
+          _persistOkCount += batch.length;
+          console.log(`[MODULE1][PERSIST] Batch of ${batch.length} already present (duplicate-key) — treated as persisted.`);
+          enqueuePivotsFor(batch);
+          continue;
+        }
+
+        _persistErrCount++;
+        const transient = isTransientWriteError(error);
+        for (const it of items) it.attempts++;
+        const exhausted = items.every(it => it.attempts >= MAX_PERSIST_ATTEMPTS);
+
+        if (isOhlcAuditEnabled()) {
+          auditLog(`[MODULE1][OHLC-AUDIT][PERSIST-FAIL] batch=${batch.length} transient=${transient} mongo=${mongoConnectionStateName()} err=${error?.message || error}`);
+        }
+
+        if (!transient || exhausted) {
+          // Permanent, or transient-but-out-of-retries → dead-letter (bounded),
+          // remove from the queue, keep going with the next batch. The candles
+          // remain in finalizedCandlesCache so the API in-memory fallback still
+          // serves them.
+          persistQueue.splice(0, items.length);
+          let dl = 0;
+          for (const it of items) {
+            if (persistDeadLetter.length < DEAD_LETTER_MAX) persistDeadLetter.push(it.candle);
+            dl++;
+          }
+          _permanentFailureCount += dl;
+          console.error(
+            `[MODULE1][PERSIST][PERMANENT] ${dl} candle(s) ${transient ? "exhausted retries" : "hit a permanent error"} ` +
+            `(mongo=${mongoConnectionStateName()}, err=${error?.message || error}) — moved to dead-letter ` +
+            `(size ${persistDeadLetter.length}), kept in memory, NOT silently dropped.`
+          );
+          continue;
+        }
+
+        // Transient and retries remain → leave the batch in the queue, back off,
+        // stop this drain. scheduleDrainRetry / the next finaliseCandle resumes.
+        const now = Date.now();
+        if (now - _persistErrLastLog > 10_000) {
+          _persistErrLastLog = now;
+          const attempt = Math.max(...items.map(it => it.attempts));
+          console.error(
+            `[MODULE1][PERSIST][ERROR] Batch of ${batch.length} failed (attempt ${attempt}/${MAX_PERSIST_ATTEMPTS}, ` +
+            `${_persistErrCount} total, mongo=${mongoConnectionStateName()}): ${error?.message || error} — will retry.`
+          );
+        }
+        const attempt = Math.max(...items.map(it => it.attempts));
+        persistBackoffUntil = Date.now() + Math.min(30_000, 1000 * 2 ** Math.max(0, attempt - 1));
+        scheduleDrainRetry(persistBackoffUntil - Date.now());
         break;
       }
-      const batch = persistQueue.splice(0, persistQueue.length);
 
-      // Async fire-and-forget archival to Module1CandleArchive (real candles only)
-      const realBatch = batch.filter(c => !c.isSynthetic);
-      if (realBatch.length > 0) {
-        void archiveModule1Candles(realBatch).catch(() => {});
-      }
-
-      // 1. One bulk upsert for the whole batch
-      try {
-        if (!isMarketDataProcessingEnabled()) break;
-        await FuturesOHLC.bulkWrite(batch.map(candleToUpsertOp), { ordered: false });
-        console.log(`[MODULE1][PERSIST] Persisted ${batch.length} finalized candle(s) in one bulk write.`);
-        if (isOhlcAuditEnabled()) {
-          for (const c of batch) {
-            if (c.timeframe !== "1m" || (c.symbol !== "NIFTY-FUT" && c.symbol !== "NIFTY-SPOT")) continue;
-            const minuteIst = new Date(c.openTime).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: false });
-            auditLog(`[MODULE1][OHLC-AUDIT][PERSISTED] symbol=${c.symbol} minute=${minuteIst} persisted=${c.open}/${c.high}/${c.low}/${c.close} synthetic=${!!c.isSynthetic}`);
-          }
-        }
-      } catch (error: any) {
-        if (!isMarketDataProcessingEnabled()) break;
-        // E11000 duplicate key: retry duplicate-key ops
-        const writeErrors: any[] = error?.writeErrors ?? [];
-        const dupes = writeErrors.filter((we: any) => we?.code === 11000);
-        let recovered = false;
-        if (dupes.length > 0 && dupes.length === writeErrors.length) {
-          try {
-            await FuturesOHLC.bulkWrite(
-              dupes.map((we: any) => candleToUpsertOp(batch[we.index])),
-              { ordered: false }
-            );
-            console.log(`[MODULE1][PERSIST] Re-applied ${dupes.length} candle upsert(s) after duplicate-key race.`);
-            recovered = true;
-          } catch { /* fall through to failure logging */ }
-        }
-        if (!recovered) {
-          _persistErrCount++;
-          const now = Date.now();
-          if (now - _persistErrLastLog > 10_000) {
-            _persistErrLastLog = now;
-            console.error(`[MODULE1][PERSIST][ERROR] Bulk persist failed (${_persistErrCount} failure(s) so far): ${error?.message || error}`);
-          }
-        }
-      }
-
-      // 2. Retention pruning — once per (symbol,timeframe) per session day
-      for (const c of batch) {
-        if (!isMarketDataProcessingEnabled()) break;
-        const key = `${c.symbol}|${c.timeframe}`;
-        const sessionOpenMs = sessionOpenForCandle(c.openTime);
-        if (prunedSessions.get(key) === sessionOpenMs) continue;
-        prunedSessions.set(key, sessionOpenMs);
-        try {
-          await FuturesOHLC.deleteMany({
-            symbol: c.symbol,
-            timeframe: c.timeframe,
-            bar_time: { $lt: new Date(Date.now() - HISTORY_RETENTION_MS) },
-          });
-        } catch { /* retried next session */ }
-      }
-
-      // 3. Pivot recalculation per finalized candle (real candles only)
-      if (onCandleFinalized && isMarketDataProcessingEnabled()) {
-        for (const c of batch) {
-          if (!isMarketDataProcessingEnabled()) break;
-          // Only recalculate pivots on real traded bars
-          if (c.isSynthetic) continue;
-          try {
-            await onCandleFinalized(c);
-          } catch (err: any) {
-            _persistErrCount++;
-            const now = Date.now();
-            if (now - _persistErrLastLog > 10_000) {
-              _persistErrLastLog = now;
-              console.error(`[MODULE1][PERSIST][ERROR] onCandleFinalized failed (${_persistErrCount} failure(s)): ${err?.message || err}`);
-            }
-          }
-        }
-      }
+      // Yield the event loop between batches so a large burst can't monopolise it.
+      if (persistQueue.length > 0) await new Promise(r => setTimeout(r, 0));
     }
   } finally {
     draining = false;
   }
+};
+
+/** Test-only: drain synchronously to a terminal state, skipping the wall-clock
+ *  backoff wait (the retry/requeue/dead-letter logic still runs in full). */
+export const __flushPersistForTest = async (maxPasses = 200): Promise<void> => {
+  for (let i = 0; i < maxPasses && persistQueue.length > 0; i++) {
+    persistBackoffUntil = 0;
+    _retryScheduled = false;
+    await drainPersistQueue();
+    await new Promise(r => setTimeout(r, 0));
+  }
+};
+
+/** Enqueue a finalized candle for durable persistence and kick the drain. */
+const queueForPersist = (candle: Candle): void => {
+  persistQueue.push({ candle, at: Date.now(), attempts: 0 });
+  void drainPersistQueue();
 };
 
 /**
@@ -579,8 +729,7 @@ const finaliseCandle = async (liveCandle: Candle) => {
     }
   }
 
-  persistQueue.push(candle);
-  void drainPersistQueue();
+  queueForPersist(candle);
 };
 
 /**

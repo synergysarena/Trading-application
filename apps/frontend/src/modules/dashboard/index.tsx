@@ -7,7 +7,7 @@ import { Worksheet } from "./Worksheet";
 import { exportModule1Excel, istDateStr } from "./excelExport";
 import { useStore } from "../../store/useStore";
 import { api } from "../../utils/api";
-import type { OHLCBar } from "../../calc";
+import type { OHLCBar, DashboardRow } from "../../calc";
 import {
   mmaBar, computeRanking,
   newTmaState, tmaAccumulate, tmaValue,
@@ -16,6 +16,7 @@ import {
   compareScore, totalScoreFromParts, ratingFromTotalScore, signalFromRating,
 } from "../../calc";
 import type { TmaState } from "../../calc";
+import { bucketKey, buildBucketMap, resolveRowOptionBars, fillGridSeries, gridEndFor, overlayOptionSide } from "./strikeMerge";
 import { formatExpiryForBroker } from "../../data/models";
 
 // -- Helpers -------------------------------------------------------------------
@@ -251,6 +252,9 @@ export function Dashboard() {
     call: newTmaState(), put: newTmaState(), fut: newTmaState(), spot: newTmaState(),
   });
   const liveFutVolumeRef = useRef<number>(0);
+  // Debounce for the "live updater detected a timeline gap → ask Effect 1 to
+  // rebuild from the backend" recovery, so a flapping feed can't reload-loop.
+  const lastGapReloadRef = useRef<number>(0);
 
   // M-4: Rehydrate user-scoped preferences on login
   const user = useStore((s) => s.user);
@@ -283,17 +287,23 @@ export function Dashboard() {
     }
 
     let cancelled = false;
-    barRef.current = null;
-    prevRsiCloses.current = [];
-    prevOiTin.current = -1;
-    prevEmaRef.current = null;
-    prevEma200Ref.current = null;
-    vwapStateRef.current = { cumTPV: 0, cumV: 0 };
-    tmaStatesRef.current = { call: newTmaState(), put: newTmaState(), fut: newTmaState(), spot: newTmaState() };
-    liveFutVolumeRef.current = 0;
+
+    // Resets the rolling indicator/accumulator state to a clean slate. Deferred
+    // until we are actually about to rebuild the table — a failed history fetch
+    // must leave BOTH the existing rows AND their accumulator state untouched,
+    // so the live updater keeps producing a correct, gap-free timeline.
+    const resetAccumulators = () => {
+      barRef.current = null;
+      prevRsiCloses.current = [];
+      prevOiTin.current = -1;
+      prevEmaRef.current = null;
+      prevEma200Ref.current = null;
+      vwapStateRef.current = { cumTPV: 0, cumV: 0 };
+      tmaStatesRef.current = { call: newTmaState(), put: newTmaState(), fut: newTmaState(), spot: newTmaState() };
+      liveFutVolumeRef.current = 0;
+    };
 
     async function init() {
-      clearRows();
       setIsLoading(true);
       setFeedStatus("connecting");
       console.log("[Module1/Data] Initializing Dashboard data load...");
@@ -309,6 +319,8 @@ export function Dashboard() {
           } else if (status && !status.zebuConnected) {
             const m1Status = useStore.getState().module1Status;
             if (m1Status !== "authenticated" && m1Status !== "authenticating") {
+              clearRows();
+              resetAccumulators();
               setFeedStatus("auth-error");
               setIsLoading(false);
               return;
@@ -372,34 +384,23 @@ export function Dashboard() {
 
         if (cancelled) return;
 
-        // 5. Normalize and build lookup maps
+        const histTfMs = tfToMs(timeframe === "custom" ? (customRange?.candleTf ?? "5m") : timeframe);
+
+        // The FUT history fetch FAILED (every retry exhausted). Never tear the
+        // table down over a transient error — keep whatever rows + accumulator
+        // state we have and let Effect 1b's timed retry re-run this loader.
+        if (timeframe !== "custom" && rawFut === null) {
+          const kept = useDashStore.getState().rows.length;
+          console.warn(`[Module1/Data] FUT history fetch failed — keeping current view (${kept} row(s)), will retry.`);
+          setIsLoading(false);
+          setFeedStatus("reconnecting");
+          return;
+        }
+
+        // 5. Normalize FUT + option series
         let futBars: OHLCBar[] = Array.isArray(rawFut)
           ? rawFut.map(normalizeBar).filter(Boolean) as OHLCBar[]
           : [];
-
-        const ceMap   = new Map<number, OHLCBar>();
-        const peMap   = new Map<number, OHLCBar>();
-        const spotMap = new Map<number, OHLCBar>();
-
-        if (Array.isArray(rawCe)) {
-          rawCe.forEach(r => { const b = normalizeBar(r); if (b) ceMap.set(b.t, b); });
-        }
-        if (Array.isArray(rawPe)) {
-          rawPe.forEach(r => { const b = normalizeBar(r); if (b) peMap.set(b.t, b); });
-        }
-        if (Array.isArray(rawSpot)) {
-          rawSpot.forEach(r => { const b = normalizeBar(r); if (b) spotMap.set(b.t, b); });
-        }
-
-        const spotWarmupCloses: number[] = Array.isArray(rawSpotWarmup)
-          ? (rawSpotWarmup.map(normalizeBar).filter(Boolean) as OHLCBar[])
-              .sort((a, b) => a.t - b.t)
-              .map(b => b.c)
-          : [];
-
-        if (process.env.NODE_ENV === "development" && (ceMap.size > 0 || peMap.size > 0)) {
-          console.log(`[C-1] Option OHLC loaded — CE bars: ${ceMap.size} PE bars: ${peMap.size} Spot bars: ${spotMap.size}`);
-        }
 
         // 6. Client-side session filter for live mode
         if (timeframe !== "custom" && futBars.length > 0) {
@@ -414,12 +415,56 @@ export function Dashboard() {
 
         // 7. Build historical rows (closed bars only for live mode)
         const nowForBoundary  = Date.now();
-        const activeTfMs      = tfToMs(timeframe === "custom" ? (customRange?.candleTf ?? "5m") : timeframe);
+        const activeTfMs      = histTfMs;
         const liveWindowStart = Math.floor(nowForBoundary / activeTfMs) * activeTfMs;
 
-        const closedBars = timeframe === "custom"
+        const spotSeries: OHLCBar[] = Array.isArray(rawSpot)
+          ? rawSpot.map(normalizeBar).filter(Boolean) as OHLCBar[]
+          : [];
+
+        // THE MARKET TIMELINE: a gap-free minute grid from the first FUT bar
+        // through the live window. Every trading minute is a row — a hole in the
+        // API response carries the previous close forward (flat, isSynthetic)
+        // rather than dropping the minute. Switching strike, a reload, or a feed
+        // blip can never skip a minute because rows come from THIS grid, not from
+        // whether the selected option happened to trade.
+        //
+        // The grid is capped at the last real FUT bar + 20 min (see gridEndFor)
+        // so it does NOT pad hundreds of flat rows after the market closes;
+        // NIFTY-FUT never goes 20 min without a tick during the session, so this
+        // never truncates a live timeline.
+        const closedFut = timeframe === "custom"
           ? futBars
           : futBars.filter(b => b.t < liveWindowStart);
+        const gridEnd = gridEndFor(closedFut, activeTfMs, liveWindowStart);
+        const closedBars = timeframe === "custom"
+          ? closedFut
+          : fillGridSeries(closedFut, activeTfMs, gridEnd);
+        const spotGrid = timeframe === "custom"
+          ? spotSeries
+          : fillGridSeries(spotSeries.filter(b => b.t < liveWindowStart), activeTfMs, gridEnd);
+
+        // Bucket-keyed lookups (immune to sub-boundary openTime drift) — a
+        // stored candle is matched to its row even if openTime is a few seconds
+        // off the boundary; only a truly absent candle yields "—".
+        const ceMap   = buildBucketMap(Array.isArray(rawCe) ? (rawCe.map(normalizeBar).filter(Boolean) as OHLCBar[]) : [], histTfMs);
+        const peMap   = buildBucketMap(Array.isArray(rawPe) ? (rawPe.map(normalizeBar).filter(Boolean) as OHLCBar[]) : [], histTfMs);
+        const spotMap = buildBucketMap(spotGrid, histTfMs);
+
+        const spotWarmupCloses: number[] = Array.isArray(rawSpotWarmup)
+          ? (rawSpotWarmup.map(normalizeBar).filter(Boolean) as OHLCBar[])
+              .sort((a, b) => a.t - b.t)
+              .map(b => b.c)
+          : [];
+
+        if (process.env.NODE_ENV === "development" && (ceMap.size > 0 || peMap.size > 0)) {
+          console.log(`[C-1] Option OHLC loaded — CE bars: ${ceMap.size} PE bars: ${peMap.size} Spot bars: ${spotMap.size}`);
+        }
+
+        // The table is about to be rebuilt from the grid above — NOW it is safe
+        // to drop the old rows + accumulators (a failed fetch already returned).
+        clearRows();
+        resetAccumulators();
 
         if (spotWarmupCloses.length > 0) {
           const warmupEma    = computeEMASeries(spotWarmupCloses, 20);
@@ -431,7 +476,7 @@ export function Dashboard() {
         if (closedBars.length > 0) {
           const futCloses       = closedBars.map(b => b.c);
           const rsiSeries       = computeRsiSeries(futCloses);
-          const spotBarsForCalc = closedBars.map(b => spotMap.get(b.t) ?? b);
+          const spotBarsForCalc = closedBars.map(b => spotMap.get(bucketKey(b.t, histTfMs)) ?? b);
           const spotCloses      = spotBarsForCalc.map(sb => sb.c);
 
           const warmupLen       = spotWarmupCloses.length;
@@ -467,9 +512,8 @@ export function Dashboard() {
             const pdh = i === 0 ? bar.h : prevH;
             const pdl = i === 0 ? bar.l : prevL;
 
-            const callBar: OHLCBar = ceMap.get(bar.t) ?? MISSING_BAR(bar.t);
-            const putBar:  OHLCBar = peMap.get(bar.t) ?? MISSING_BAR(bar.t);
-            const spotBar: OHLCBar = spotMap.get(bar.t) ?? bar;
+            const { callBar, putBar } = resolveRowOptionBars(bar.t, ceMap, peMap, histTfMs);
+            const spotBar: OHLCBar = spotMap.get(bucketKey(bar.t, histTfMs)) ?? bar;
 
             const cMMA = mmaBar(callBar);
             const pMMA = mmaBar(putBar);
@@ -522,7 +566,7 @@ export function Dashboard() {
           swLowRef.current  = sessionLow;
 
           const last        = closedBars[closedBars.length - 1];
-          const lastSpotBar = spotMap.get(last.t) ?? last;
+          const lastSpotBar = spotMap.get(bucketKey(last.t, histTfMs)) ?? last;
           setLivePrices(lastSpotBar.c, last.c);
           useStore.getState().updatePrice("NIFTY-SPOT", lastSpotBar.c);
           useStore.getState().updatePrice("NIFTY-FUT", last.c);
@@ -553,8 +597,78 @@ export function Dashboard() {
 
     init();
     return () => { cancelled = true; };
+    // NOTE: callStrike / putStrike are deliberately NOT dependencies. The FUT/
+    // SPOT market timeline and every indicator column are strike-independent —
+    // rebuilding them on a strike change is what let a slow PE re-fetch wipe the
+    // PE column when the user only touched CE. Effects 1c / 1d below re-overlay
+    // ONE option side each, in place, leaving the timeline and the other side
+    // untouched. `type` stays a dependency because it changes which columns exist.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isGenerated, instrument, timeframe, customRange, reloadKey, generateKey, expiryDate, callStrike, putStrike, type]);
+  }, [isGenerated, instrument, timeframe, customRange, reloadKey, generateKey, expiryDate, type]);
+
+  // Effects 1c / 1d: INDEPENDENT per-side option overlays. Changing the Call
+  // strike re-fetches ONLY that CE symbol's stored history and rewrites ONLY the
+  // Call columns of the rows that already exist; the Put side, FUT/SPOT and the
+  // timeline are never touched (and vice-versa for Effect 1d). Missing option
+  // candle → "—"; nothing is fabricated or carried forward.
+  const ceOverlayRef = useRef<{ armed: number | null; gen: number }>({ armed: null, gen: 0 });
+  const peOverlayRef = useRef<{ armed: number | null; gen: number }>({ armed: null, gen: 0 });
+
+  const runSideOverlay = (
+    side: "call" | "put",
+    strike: number | null,
+    stateRef: { current: { armed: number | null; gen: number } },
+  ) => {
+    if (!isGenerated || timeframe === "custom") { stateRef.current.armed = null; return; }
+
+    const key = strike ?? -1;
+    if (stateRef.current.armed === null) { stateRef.current.armed = key; return; } // Effect 1 owns the first load
+    if (stateRef.current.armed === key) return;
+    stateRef.current.armed = key;
+
+    const myGen = ++stateRef.current.gen;
+    const includes = side === "call" ? (type === "Call" || type === "Call+Put") : (type === "Put" || type === "Call+Put");
+    const expiryFmt = formatExpiryForBroker(expiryDate);
+    const letter = side === "call" ? "C" : "P";
+    const sym = (expiryFmt && includes && strike) ? `${instrument}${expiryFmt}${letter}${strike}` : null;
+
+    // Blank this side's forming-bar fields so a stale premium can't bleed in.
+    if (barRef.current) {
+      if (side === "call") barRef.current.callO = barRef.current.callH = barRef.current.callL = barRef.current.callC = NaN;
+      else                 barRef.current.putO  = barRef.current.putH  = barRef.current.putL  = barRef.current.putC  = NaN;
+    }
+
+    (async () => {
+      const tf = timeframe;
+      const raw = sym ? await api.get(`/api/market/ohlc/${sym}/${tf}?limit=400`).catch(() => null) : [];
+      if (stateRef.current.gen !== myGen) return; // superseded by a newer switch
+      const bars = Array.isArray(raw) ? (raw.map(normalizeBar).filter(Boolean) as OHLCBar[]) : [];
+
+      const tfMs = tfToMs(tf);
+      const liveWindowStart = Math.floor(Date.now() / tfMs) * tfMs;
+      const cur = useDashStore.getState().rows;
+      if (cur.length === 0) return;
+
+      const { rows: next, tma } = overlayOptionSide(cur, side, bars, tfMs, liveWindowStart);
+      if (stateRef.current.gen !== myGen) return;
+      if (side === "call") tmaStatesRef.current.call = tma;
+      else                 tmaStatesRef.current.put = tma;
+      useDashStore.getState().setRows(next);
+      console.log(`[Module1/Data] ${side.toUpperCase()} strike overlay ${sym ?? "(cleared)"} — ${bars.length} bar(s) onto ${next.length} rows (other side + timeline untouched).`);
+    })();
+  };
+
+  useEffect(() => {
+    runSideOverlay("call", callStrike, ceOverlayRef);
+    return () => { ceOverlayRef.current.gen++; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isGenerated, timeframe, callStrike]);
+
+  useEffect(() => {
+    runSideOverlay("put", putStrike, peOverlayRef);
+    return () => { peOverlayRef.current.gen++; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isGenerated, timeframe, putStrike]);
 
   // Effect 1b: automatic recovery from a stuck error state
   useEffect(() => {
@@ -660,6 +774,53 @@ export function Dashboard() {
           }
           if (!isNaN(pb.futH)) swHighRef.current = Math.max(swHighRef.current, pb.futH);
           if (!isNaN(pb.futL)) swLowRef.current  = Math.min(swLowRef.current,  pb.futL);
+        }
+
+        // ── Timeline gap-fill ────────────────────────────────────────────
+        // The updater may have missed cycles (feed blip, backgrounded tab,
+        // a reconnect). EVERY market minute between the last row and this
+        // window must still be a row — insert flat carry-forward rows for
+        // the skipped minutes (FUT/SPOT carried forward, options "—") and
+        // ask Effect 1 to heal them from the backend, which holds the real
+        // candles (including real option data).
+        {
+          const lastRow = dash.rows[dash.rows.length - 1];
+          if (lastRow && windowStart - lastRow.t > tfMs) {
+            const gapCount = Math.round((windowStart - lastRow.t) / tfMs) - 1;
+            let carry: DashboardRow = lastRow;
+            const firstFill = Math.max(lastRow.t + tfMs, windowStart - 360 * tfMs);
+            for (let gt = firstFill; gt < windowStart; gt += tfMs) {
+              const fc = carry.future.c;
+              const sc = carry.spot.c;
+              const flatFut:  OHLCBar = { t: gt, o: fc, h: fc, l: fc, c: fc, isSynthetic: true };
+              const flatSpot: OHLCBar = { t: gt, o: sc, h: sc, l: sc, c: sc, isSynthetic: true };
+              const miss = MISSING_BAR(gt);
+              if (!isNaN(fc)) prevRsiCloses.current = [...prevRsiCloses.current, fc].slice(-50);
+              if (prevEmaRef.current    !== null && !isNaN(sc)) prevEmaRef.current    = sc * (2 / 21)  + prevEmaRef.current    * (1 - 2 / 21);
+              if (prevEma200Ref.current !== null && !isNaN(sc)) prevEma200Ref.current = sc * (2 / 201) + prevEma200Ref.current * (1 - 2 / 201);
+              tmaAccumulate(tmaStatesRef.current.fut,  flatFut);
+              tmaAccumulate(tmaStatesRef.current.spot, flatSpot);
+              const gRow: DashboardRow = {
+                ...carry,
+                t: gt,
+                future: flatFut, spot: flatSpot, call: miss, put: miss,
+                callMMA: NaN, putMMA: NaN,
+                futureMMA: mmaBar(flatFut), spotMMA: mmaBar(flatSpot),
+                futureTMA: tmaValue(tmaStatesRef.current.fut),
+                spotTMA: tmaValue(tmaStatesRef.current.spot),
+                ranking: 0, rankingWinner: "call",
+                oiMatrix: null,
+              };
+              dash.appendRow(gRow);
+              carry = gRow;
+            }
+            const nowMs = Date.now();
+            if (nowMs - lastGapReloadRef.current > 15000) {
+              lastGapReloadRef.current = nowMs;
+              console.warn(`[Module1/Data] Timeline gap of ${gapCount} minute(s) carry-filled — requesting backend rebuild.`);
+              bumpReloadKey();
+            }
+          }
         }
 
         if (dash.rows.length === 0) {

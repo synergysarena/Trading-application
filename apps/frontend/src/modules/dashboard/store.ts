@@ -70,6 +70,10 @@ interface DashboardStore {
   generate(): void;
   reset(): void;
   clearRows(): void;
+  /** Replace the row array wholesale — used by the independent CE / PE overlay
+   *  effects, which rewrite ONE option side of every row without a
+   *  clearRows()+full-rebuild that would disturb the timeline or the other side. */
+  setRows(rows: DashboardRow[]): void;
   setTimeframe(tf: string): void;
   setCustomRange(r: { from: string; to: string; candleTf: string } | null): void;
   setPivotMethod(m: PivotMethod): void;
@@ -129,6 +133,7 @@ export const useDashStore = create<DashboardStore>((set, get) => ({
   bumpReloadKey: ()  => set((s) => ({ reloadKey: s.reloadKey + 1 })),
   reset:         ()  => set({ isGenerated: false, rows: [], feedStatus: "idle" }),
   clearRows:     ()  => set({ rows: [] }),
+  setRows:       (rows) => set({ rows }),
   setTimeframe:  (tf) => set({ timeframe: tf }),
   setCustomRange: (r) => set({ customRange: r }),
 

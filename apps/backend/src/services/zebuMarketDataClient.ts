@@ -350,11 +350,19 @@ export const startZebuMarketDataFeedWithCredentials = (
   const subscribedKeys = new Set<string>(instruments.map((i) => i.key));
   let pendingExtra: ZebuInstrument[] = [];
 
+  // Noren accepts a '#'-delimited key list per {t:"t"} frame. The full NIFTY
+  // option chain can be several hundred instruments, so the initial subscribe is
+  // chunked into bounded frames rather than one very large one.
+  const SUBSCRIBE_CHUNK = Number(process.env.MODULE1_SUBSCRIBE_CHUNK) || 100;
   const sendSubscribe = (toSend: ZebuInstrument[], label: string) => {
     if (toSend.length === 0) return;
-    const keys = toSend.map((i) => i.key).join("#");
-    ws.send(JSON.stringify({ t: "t", k: keys }));
-    console.log(`[Feed:SUB] ${label} — ${toSend.length} instrument(s): ${keys.substring(0, 200)}${keys.length > 200 ? "…" : ""}`);
+    for (let i = 0; i < toSend.length; i += SUBSCRIBE_CHUNK) {
+      const slice = toSend.slice(i, i + SUBSCRIBE_CHUNK);
+      const keys = slice.map((x) => x.key).join("#");
+      ws.send(JSON.stringify({ t: "t", k: keys }));
+      const part = toSend.length > SUBSCRIBE_CHUNK ? ` [${i + 1}-${i + slice.length}/${toSend.length}]` : "";
+      console.log(`[Feed:SUB] ${label}${part} — ${slice.length} instrument(s): ${keys.substring(0, 160)}${keys.length > 160 ? "…" : ""}`);
+    }
   };
 
   const subscribeTokens = (newInstruments: ZebuInstrument[]) => {
@@ -392,9 +400,23 @@ export const startZebuMarketDataFeedWithCredentials = (
   }, 60000);
 
   console.log(`[Feed] Connecting with session for user: ${userId} | URL: ${sanitizeFeedUrl(wsUrl)}`);
-  console.log(`[Feed] Instrument list (${instruments.length}):`);
-  for (const inst of instruments) {
-    console.log(`  [Feed]   ${inst.key} → ${inst.symbol}`);
+  {
+    // Summary only — the full option chain can be several hundred instruments;
+    // dumping every line on each (re)connect floods the log. Set
+    // MODULE1_FEED_LIST_VERBOSE=true to print the complete list when debugging.
+    const optCount = instruments.filter(i => /[CP]\d+$/.test(i.symbol)).length;
+    const ceCount = instruments.filter(i => /C\d+$/.test(i.symbol)).length;
+    const peCount = instruments.filter(i => /P\d+$/.test(i.symbol)).length;
+    console.log(
+      `[Feed] Instrument list: ${instruments.length} total ` +
+      `(${ceCount} CE + ${peCount} PE + ${instruments.length - optCount} index/futures).`
+    );
+    if (process.env.MODULE1_FEED_LIST_VERBOSE === "true") {
+      for (const inst of instruments) console.log(`  [Feed]   ${inst.key} → ${inst.symbol}`);
+    } else {
+      for (const inst of instruments.slice(0, 6)) console.log(`  [Feed]   ${inst.key} → ${inst.symbol}`);
+      if (instruments.length > 6) console.log(`  [Feed]   … and ${instruments.length - 6} more (set MODULE1_FEED_LIST_VERBOSE=true for all)`);
+    }
   }
   if (instruments.length === 0) {
     console.error("[Feed] FATAL: No instruments configured. Set ZEBU_NIFTY_FUT_TOKEN, ZEBU_NIFTY_CE_TOKENS, ZEBU_NIFTY_PE_TOKENS in .env");
@@ -446,8 +468,7 @@ export const startZebuMarketDataFeedWithCredentials = (
           console.log(`[Feed:ACK] Connection acknowledged by Zebu (s=${record.s}). Sending subscriptions...`);
           if (subscribeKeys && !subscriptionSent) {
             subscriptionSent = true;
-            ws.send(JSON.stringify({ t: "t", k: subscribeKeys }));
-            console.log(`[Feed:SUB] Subscription sent — ${instruments.length} instruments: ${subscribeKeys.substring(0, 120)}${subscribeKeys.length > 120 ? "…" : ""}`);
+            sendSubscribe(instruments, "Initial subscription");
             // Flush any tokens that were requested (on-demand option resolve, ATM recompute)
             // before the connection finished authenticating.
             if (pendingExtra.length > 0) {

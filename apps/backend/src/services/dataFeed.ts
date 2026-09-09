@@ -84,6 +84,21 @@ let reconnectAttempts = 0;
 let reconnectTimer: NodeJS.Timeout | null = null;
 let sessionExpired = false;
 
+// Cumulative reconnect count for this process (never reset on a successful
+// connect, unlike reconnectAttempts) — surfaced by the persistence-health
+// logger so a WS reconnect storm is visible alongside persist lag.
+let totalReconnects = 0;
+let lastDisconnectReason = "";
+let lastDisconnectAt = 0;
+
+export const getModule1FeedStats = () => ({
+  connected: isZebuLiveConnected(),
+  totalReconnects,
+  reconnectAttempts,
+  lastDisconnectReason,
+  lastDisconnectAt,
+});
+
 // Each call to startDataFeedWithCredentials / stopDataFeed increments this
 // counter. Disconnect callbacks capture their generation at creation time and
 // bail out if it no longer matches — preventing a closing old connection from
@@ -107,6 +122,8 @@ const handleFeedDisconnect = (reason: string, gen: number) => {
 
   zebuClient = null;
   setModule1OiDataSource("SIMULATOR");
+  lastDisconnectReason = reason;
+  lastDisconnectAt = Date.now();
 
   if (sessionExpired) return;
 
@@ -119,6 +136,7 @@ const handleFeedDisconnect = (reason: string, gen: number) => {
   // Resilient exponential backoff capped at 30 seconds for background recovery
   const delay = Math.min(30000, Math.round(RECONNECT_BASE_DELAY_MS * Math.pow(1.5, Math.min(reconnectAttempts, 10))));
   reconnectAttempts++;
+  totalReconnects++;
   console.log(`[DataFeed] Reconnecting in ${delay}ms (attempt #${reconnectAttempts}) — reason: ${reason}…`);
   broadcastBrokerStatus("reconnecting", `Attempt #${reconnectAttempts}`, "module1");
 
