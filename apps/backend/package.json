@@ -11,7 +11,7 @@
     "build": "tsc",
     "start": "node dist/server.js",
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
-    "test": "ts-node --transpile-only src/scripts/test_module2_persistence.ts && ts-node --transpile-only src/scripts/test_module2_reconnect_discovery.ts && ts-node --transpile-only src/scripts/test_module2_market_hours.ts && ts-node --transpile-only src/scripts/test_module1_ohlc_audit.ts && ts-node --transpile-only src/scripts/test_module1_pivot_persistence.ts && ts-node --transpile-only src/scripts/test_module1_option_universe.ts && ts-node --transpile-only src/scripts/test_module1_timeline_continuity.ts && ts-node --transpile-only src/scripts/test_module1_persist_pivot_decoupling.ts && ts-node --transpile-only src/scripts/test_module1_persist_retry.ts"
+    "test": "ts-node --transpile-only src/scripts/test_module2_persistence.ts && ts-node --transpile-only src/scripts/test_module2_reconnect_discovery.ts && ts-node --transpile-only src/scripts/test_module2_market_hours.ts && ts-node --transpile-only src/scripts/test_module1_ohlc_audit.ts && ts-node --transpile-only src/scripts/test_module1_pivot_persistence.ts && ts-node --transpile-only src/scripts/test_module1_option_universe.ts && ts-node --transpile-only src/scripts/test_module1_timeline_continuity.ts && ts-node --transpile-only src/scripts/test_module1_persist_pivot_decoupling.ts && ts-node --transpile-only src/scripts/test_module1_persist_retry.ts && ts-node --transpile-only src/scripts/test_module1_reconnect_hardening.ts"
   },
   "dependencies": {
     "@stock/shared": "*",

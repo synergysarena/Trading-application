@@ -5,6 +5,16 @@ import { debugLog } from "../utils/logger";
 
 type DataSource = "LIVE_MARKET_API" | "SIMULATOR";
 
+// Test seam: lets a regression test drive the Zebu reconnect/session-expiry state
+// machine with a fake, in-memory WebSocket instead of a real network socket —
+// same pattern already used for the Mongo/pivot writers (see ohlcAggregator.ts,
+// pivotService.ts). Production always uses the real `ws` client.
+type WebSocketFactory = (url: string) => WebSocket;
+let _wsFactory: WebSocketFactory = (url: string) => new WebSocket(url);
+export const __setWebSocketFactoryForTest = (fn: WebSocketFactory | null): void => {
+  _wsFactory = fn || ((url: string) => new WebSocket(url));
+};
+
 let wsConnected = false;
 export const isZebuLiveConnected = () => wsConnected;
 
@@ -294,14 +304,81 @@ export const startZebuMarketDataFeed = (
  * Start Zebu feed using runtime credentials (from user-initiated broker login).
  * Instruments remain env-configured (they are configuration, not credentials).
  */
-const SESSION_EXPIRY_PATTERNS = [
-  "session expired", "sessionexpired", "invalid session", "token expired",
-  "susertoken", "not_ok", "login", "unauthorized", "invalid user"
+// Deliberately scoped to phrases that are ONLY meaningful for a connection-ack
+// (t:"ck") rejection — i.e. the session/credentials themselves, never a
+// per-instrument/market-data condition. Generic words like "Not_Ok" or "login"
+// are excluded here on purpose: a `ck` rejection can legitimately carry a vague
+// `Not_Ok` for reasons that are NOT session invalidity (e.g. a transient
+// broker-side hiccup), and misclassifying that as "session expired" would force
+// a user to re-login when a plain reconnect would have worked. Anything this
+// list doesn't recognize is still caught by the repeated-rejection fallback
+// below (see shouldTreatSessionAsInvalid), which is what actually protects
+// against reusing a definitely-dead token forever.
+export const SESSION_EXPIRY_PATTERNS = [
+  // Explicit session/token expiry or invalidity
+  "session expired", "session is expired", "session has expired", "sessionexpired",
+  "invalid session", "session invalid", "invalid susertoken", "invalid session key",
+  "susertoken",
+  "token expired", "token has expired", "expired token", "token invalid", "invalid token",
+  // Explicit re-authentication requirements
+  "please login", "please re-login", "please login again", "login again", "relogin required",
+  "user not login", "not logged in", "login required", "re-authenticate", "reauthenticate",
+  // Explicit unauthorized/credential rejection (not a generic "Not_Ok")
+  "unauthorized", "unauthorised", "authentication failed", "auth failed", "invalid user",
+  "invalid credential", "invalid login",
 ];
 
-const isSessionExpiredMessage = (emsg?: string, stat?: string): boolean => {
+export const isSessionExpiredMessage = (emsg?: string, stat?: string): boolean => {
   const combined = `${emsg || ""} ${stat || ""}`.toLowerCase();
   return SESSION_EXPIRY_PATTERNS.some(p => combined.includes(p));
+};
+
+// ── Repeated-rejection fallback ─────────────────────────────────────────────
+// Structural safety net for a `ck` rejection whose wording isn't recognized by
+// SESSION_EXPIRY_PATTERNS above. A `ck` frame exists ONLY to validate the
+// connect handshake (uid/actid/susertoken) — there is no legitimate reason for
+// the SAME session token to be rejected by it more than once in a row. If it
+// is, the token is being treated as invalid regardless of the exact wording,
+// which is what stops the old "reuse the same dead token forever" loop even
+// when Zebu's rejection text doesn't match a known phrase.
+const SESSION_INVALID_REJECT_THRESHOLD =
+  Math.max(1, Number(process.env.MODULE1_SESSION_INVALID_REJECT_THRESHOLD) || 2);
+let lastRejectedSessionToken: string | null = null;
+let consecutiveSessionRejections = 0;
+
+export const __resetSessionRejectionTrackingForTest = (): void => {
+  lastRejectedSessionToken = null;
+  consecutiveSessionRejections = 0;
+};
+
+/**
+ * Decides whether a `ck` rejection means "this session token is dead" (stop
+ * retrying it) as opposed to "transient — keep reconnecting with it". Never
+ * throws; always returns a definite true/false so the caller's branch stays
+ * deterministic and explainable in logs.
+ */
+const shouldTreatSessionAsInvalid = (
+  sessionToken: string,
+  emsg?: string,
+  stat?: string
+): { invalid: boolean; matchedKnownPattern: boolean; consecutiveRejections: number } => {
+  const matchedKnownPattern = isSessionExpiredMessage(emsg, stat);
+
+  if (lastRejectedSessionToken === sessionToken) {
+    consecutiveSessionRejections++;
+  } else {
+    lastRejectedSessionToken = sessionToken;
+    consecutiveSessionRejections = 1;
+  }
+
+  const invalid = matchedKnownPattern || consecutiveSessionRejections >= SESSION_INVALID_REJECT_THRESHOLD;
+  return { invalid, matchedKnownPattern, consecutiveRejections: consecutiveSessionRejections };
+};
+
+/** Called on any successful `ck` ack — the token just proved itself valid. */
+const clearSessionRejectionTracking = (): void => {
+  lastRejectedSessionToken = null;
+  consecutiveSessionRejections = 0;
 };
 
 // Dynamic runtime subscriptions (e.g. option strikes requested by user)
@@ -311,6 +388,17 @@ const dynamicSubscribedInstruments = new Map<string, ZebuInstrument>();
 export const clearDynamicSubscribedInstruments = () => {
   dynamicSubscribedInstruments.clear();
 };
+
+// ── Subscription-restoration diagnostics (lightweight, not per-tick) ───────
+// Read by getModule1SubscriptionStats() so an incident can answer "how many
+// instruments did we expect vs. actually request on the last (re)connect".
+let lastSubscriptionStats = {
+  expectedInstrumentCount: 0,
+  subscriptionRequestsSent: 0,
+  subscriptionRestoredAt: null as number | null,
+};
+
+export const getModule1SubscriptionStats = () => ({ ...lastSubscriptionStats });
 
 export const startZebuMarketDataFeedWithCredentials = (
   userId: string,
@@ -342,6 +430,20 @@ export const startZebuMarketDataFeedWithCredentials = (
   let lastPayload: any = null;
   let liveConnected = false;
   let subscriptionSent = false;
+  let firstTickLoggedThisConnection = false;
+
+  // Snapshot the expected universe for this connection attempt up front —
+  // used both for the "Instrument list" summary log and the subscription-
+  // restoration diagnostics below.
+  const optCount = instruments.filter(i => /[CP]\d+$/.test(i.symbol)).length;
+  const ceCount = instruments.filter(i => /C\d+$/.test(i.symbol)).length;
+  const peCount = instruments.filter(i => /P\d+$/.test(i.symbol)).length;
+  let subscriptionRequestsSent = 0;
+  lastSubscriptionStats = {
+    expectedInstrumentCount: instruments.length,
+    subscriptionRequestsSent: 0,
+    subscriptionRestoredAt: null,
+  };
 
   // ── Runtime (post-connect) subscription support ────────────────────────────
   // Lets the rest of the app (on-demand option requests, ATM-band recompute once a real
@@ -364,6 +466,8 @@ export const startZebuMarketDataFeedWithCredentials = (
       const part = toSend.length > SUBSCRIBE_CHUNK ? ` [${i + 1}-${i + slice.length}/${toSend.length}]` : "";
       console.log(`[Feed:SUB] ${label}${part} — ${slice.length} instrument(s): ${keys.substring(0, 160)}${keys.length > 160 ? "…" : ""}`);
     }
+    subscriptionRequestsSent += toSend.length;
+    lastSubscriptionStats = { ...lastSubscriptionStats, subscriptionRequestsSent };
   };
 
   const subscribeTokens = (newInstruments: ZebuInstrument[]) => {
@@ -400,14 +504,39 @@ export const startZebuMarketDataFeedWithCredentials = (
     msgCountThisMinute = 0;
   }, 60000);
 
+  // ── Silent-failure watchdog ─────────────────────────────────────────────────
+  // Zebu sends a "t":"h" heartbeat periodically even when no instrument has a
+  // fresh price, so ANY message (heartbeat, snapshot, tick, even a malformed
+  // frame) is proof the socket is genuinely alive. If NOTHING arrives for
+  // IDLE_TIMEOUT_MS, the socket is open but not actually delivering data — close
+  // it and let the existing close/reconnect flow recover it normally. This is
+  // deliberately generous so a quiet options market never trips it; it only
+  // catches a socket that has gone completely silent.
+  const IDLE_TIMEOUT_MS = Math.max(15_000, Number(process.env.MODULE1_WS_IDLE_TIMEOUT_MS) || 90_000);
+  const IDLE_CHECK_INTERVAL_MS = Math.max(5_000, Number(process.env.MODULE1_WS_IDLE_CHECK_INTERVAL_MS) || 15_000);
+  let lastActivityAt = Date.now();
+  let idleWatchdogFired = false;
+  const idleWatchdogInterval = setInterval(() => {
+    if (idleWatchdogFired) return;
+    const idleMs = Date.now() - lastActivityAt;
+    if (idleMs > IDLE_TIMEOUT_MS) {
+      idleWatchdogFired = true;
+      console.warn(
+        `[Feed] Idle watchdog: no messages (not even a heartbeat) from Zebu for ${idleMs}ms ` +
+        `(limit ${IDLE_TIMEOUT_MS}ms) — closing the socket so the normal reconnect flow can recover it.`
+      );
+      try {
+        if (typeof (ws as any).terminate === "function") (ws as any).terminate();
+        else ws.close();
+      } catch { /* the close/error handler below will still run the reconnect flow */ }
+    }
+  }, IDLE_CHECK_INTERVAL_MS);
+
   console.log(`[Feed] Connecting with session for user: ${userId} | URL: ${sanitizeFeedUrl(wsUrl)}`);
   {
     // Summary only — the full option chain can be several hundred instruments;
     // dumping every line on each (re)connect floods the log. Set
     // MODULE1_FEED_LIST_VERBOSE=true to print the complete list when debugging.
-    const optCount = instruments.filter(i => /[CP]\d+$/.test(i.symbol)).length;
-    const ceCount = instruments.filter(i => /C\d+$/.test(i.symbol)).length;
-    const peCount = instruments.filter(i => /P\d+$/.test(i.symbol)).length;
     console.log(
       `[Feed] Instrument list: ${instruments.length} total ` +
       `(${ceCount} CE + ${peCount} PE + ${instruments.length - optCount} index/futures).`
@@ -423,7 +552,7 @@ export const startZebuMarketDataFeedWithCredentials = (
     console.error("[Feed] FATAL: No instruments configured. Set ZEBU_NIFTY_FUT_TOKEN, ZEBU_NIFTY_CE_TOKENS, ZEBU_NIFTY_PE_TOKENS in .env");
   }
 
-  const ws = new WebSocket(wsUrl);
+  const ws = _wsFactory(wsUrl);
 
   ws.on("open", () => {
     wsConnected = true;
@@ -446,6 +575,9 @@ export const startZebuMarketDataFeedWithCredentials = (
   });
 
   ws.on("message", async (raw) => {
+    // Any inbound byte — heartbeat, snapshot, tick, even something malformed —
+    // proves the socket is alive. Reset the idle watchdog unconditionally.
+    lastActivityAt = Date.now();
     const rawStr = raw.toString();
     msgCountThisMinute++;
     totalMsgCount++;
@@ -461,99 +593,137 @@ export const startZebuMarketDataFeedWithCredentials = (
     const records = Array.isArray(payload) ? payload : [payload];
 
     for (const record of records) {
-      const t = record.t;
+      // Fault isolation: one malformed/unexpected record must never abort the
+      // rest of this batch, and must never escape as an unhandled promise
+      // rejection (which — with no process-wide unhandledRejection handler —
+      // would crash the whole backend). Every other valid record in the same
+      // message is still processed.
+      try {
+        const t = record.t;
 
-      // ── Connection acknowledgement ─────────────────────────────────────────
-      if (t === "ck") {
-        if (record.s === "OK" || record.s === "Ok") {
-          console.log(`[Feed:ACK] Connection acknowledged by Zebu (s=${record.s}). Sending subscriptions...`);
-          if (subscribeKeys && !subscriptionSent) {
-            subscriptionSent = true;
-            sendSubscribe(instruments, "Initial subscription");
-            // Flush any tokens that were requested (on-demand option resolve, ATM recompute)
-            // before the connection finished authenticating.
-            if (pendingExtra.length > 0) {
-              sendSubscribe(pendingExtra, "Flushing queued subscribe");
-              pendingExtra = [];
+        // ── Connection acknowledgement ─────────────────────────────────────────
+        if (t === "ck") {
+          if (record.s === "OK" || record.s === "Ok") {
+            console.log(`[Feed:ACK] Connection acknowledged by Zebu (s=${record.s}). Sending subscriptions...`);
+            clearSessionRejectionTracking();
+            if (subscribeKeys && !subscriptionSent) {
+              subscriptionSent = true;
+              sendSubscribe(instruments, "Initial subscription");
+              // Flush any tokens that were requested (on-demand option resolve, ATM recompute)
+              // before the connection finished authenticating.
+              if (pendingExtra.length > 0) {
+                sendSubscribe(pendingExtra, "Flushing queued subscribe");
+                pendingExtra = [];
+              }
+              lastSubscriptionStats = { ...lastSubscriptionStats, subscriptionRestoredAt: Date.now() };
+              console.log(
+                `[Feed:SUB] Subscription restoration complete — requested ${subscriptionRequestsSent}/${instruments.length} ` +
+                `expected instrument(s) (CE=${ceCount} PE=${peCount} FUT/SPOT/other=${instruments.length - optCount}).`
+              );
+              // Connection is authenticated and subscription is in-flight. Signal live
+              // to the frontend now so the dashboard transitions out of "connecting".
+              onConnected?.();
+            } else if (!subscribeKeys) {
+              console.error("[Feed:SUB] No subscribe keys — no instruments configured in .env");
             }
-            // Connection is authenticated and subscription is in-flight. Signal live
-            // to the frontend now so the dashboard transitions out of "connecting".
-            onConnected?.();
-          } else if (!subscribeKeys) {
-            console.error("[Feed:SUB] No subscribe keys — no instruments configured in .env");
-          }
-        } else {
-          console.error(`[Feed:ACK] Connection REJECTED by Zebu — s="${record.s}" emsg="${record.emsg ?? "(none)"}" | Full: ${JSON.stringify(record)}`);
-          if (isSessionExpiredMessage(record.emsg, record.s) && onSessionExpired) {
-            console.warn("[Feed:ACK] Session token rejected — likely expired. Triggering session expiry handler.");
-            onSessionExpired();
           } else {
-            onFallback(`Zebu rejected connection: ${record.emsg || record.s}`);
+            console.error(`[Feed:ACK] Connection REJECTED by Zebu — s="${record.s}" emsg="${record.emsg ?? "(none)"}" | Full: ${JSON.stringify(record)}`);
+            const decision = shouldTreatSessionAsInvalid(sessionToken, record.emsg, record.s);
+            if (decision.invalid && onSessionExpired) {
+              console.warn(
+                `[Feed:ACK] Treating broker session as INVALID (matchedKnownPattern=${decision.matchedKnownPattern}, ` +
+                `consecutiveRejections=${decision.consecutiveRejections}/${SESSION_INVALID_REJECT_THRESHOLD}) — ` +
+                `halting automatic reconnect for this token. Fresh broker login required.`
+              );
+              onSessionExpired();
+            } else {
+              console.warn(
+                `[Feed:ACK] Connection rejected but not (yet) classified as session-invalid ` +
+                `(consecutiveRejections=${decision.consecutiveRejections}/${SESSION_INVALID_REJECT_THRESHOLD}) — reconnecting normally.`
+              );
+              onFallback(`Zebu rejected connection: ${record.emsg || record.s}`);
+            }
           }
+          continue;
         }
-        continue;
-      }
 
-      // ── Subscription acknowledgement / initial touchline snapshot ────────────
-      // Zebu sends t:"tk" as the FIRST price snapshot for each subscribed
-      // instrument after a t:"t" subscribe. It carries lp, oi, ft etc. — NOT
-      // an s:"OK" acknowledgement field. The only s field in the protocol is on
-      // t:"ck" (connection ack). Processing tk as if s:"OK" were required caused
-      // ws.close() on every valid snapshot → the Live→Reconnecting reconnect loop.
-      if (t === "tk") {
-        const isExplicitRejection = record.s === "Not_Ok" || record.s === "Not_OK";
-        if (isExplicitRejection) {
-          // Zebu explicitly rejected this specific token (expired contract, bad token etc.)
-          // Log and skip — do NOT close the WS. Other instruments still deliver ticks.
-          console.error(`[Feed:ACK] Token rejected by Zebu — tk="${record.tk ?? "(none)"}" emsg="${record.emsg ?? "(none)"}" — skipping (feed stays open for other instruments).`);
-        } else {
-          // Normal case: process as initial price snapshot (same path as t:"tf" ticks)
-          const tick = toTick(record, symbolByKey);
-          if (tick) {
-            tickCount++;
-            lastPayload = tick;
-            await onTick(tick);
-            debugLog(`[Feed:SNAP] Initial snapshot — ${tick.symbol} ltp=${tick.ltp} oi=${tick.oi ?? "—"}`);
+        // ── Subscription acknowledgement / initial touchline snapshot ────────────
+        // Zebu sends t:"tk" as the FIRST price snapshot for each subscribed
+        // instrument after a t:"t" subscribe. It carries lp, oi, ft etc. — NOT
+        // an s:"OK" acknowledgement field. The only s field in the protocol is on
+        // t:"ck" (connection ack). Processing tk as if s:"OK" were required caused
+        // ws.close() on every valid snapshot → the Live→Reconnecting reconnect loop.
+        if (t === "tk") {
+          const isExplicitRejection = record.s === "Not_Ok" || record.s === "Not_OK";
+          if (isExplicitRejection) {
+            // Zebu explicitly rejected this specific token (expired contract, bad token etc.)
+            // Log and skip — do NOT close the WS. Other instruments still deliver ticks.
+            console.error(`[Feed:ACK] Token rejected by Zebu — tk="${record.tk ?? "(none)"}" emsg="${record.emsg ?? "(none)"}" — skipping (feed stays open for other instruments).`);
           } else {
-            // Pre-market or no LTP yet — instrument confirmed but price pending
-            debugLog(`[Feed:SNAP] tk received (no price yet) — tk="${record.tk || "(none)"}" e="${record.e || "(none)"}" ts="${record.ts || "(none)"}"`);
+            // Normal case: process as initial price snapshot (same path as t:"tf" ticks)
+            const tick = toTick(record, symbolByKey);
+            if (tick) {
+              tickCount++;
+              lastPayload = tick;
+              await onTick(tick);
+              if (!firstTickLoggedThisConnection) {
+                firstTickLoggedThisConnection = true;
+                console.log(`[Feed] First tick received since (re)connect — feed confirmed live for symbol=${tick.symbol}.`);
+              }
+              debugLog(`[Feed:SNAP] Initial snapshot — ${tick.symbol} ltp=${tick.ltp} oi=${tick.oi ?? "—"}`);
+            } else {
+              // Pre-market or no LTP yet — instrument confirmed but price pending
+              debugLog(`[Feed:SNAP] tk received (no price yet) — tk="${record.tk || "(none)"}" e="${record.e || "(none)"}" ts="${record.ts || "(none)"}"`);
+            }
+          }
+          continue;
+        }
+
+        // ── Heartbeat / ping ───────────────────────────────────────────────────
+        if (t === "h") {
+          debugLog(`[Feed:PING] Heartbeat from Zebu (msg #${totalMsgCount})`);
+          continue;
+        }
+
+        // ── Broker-level error ─────────────────────────────────────────────────
+        if (record.s === "Not_Ok" || (record.emsg && !t)) {
+          console.error(`[Feed:ERROR] Broker error — emsg="${record.emsg ?? "(none)"}" | Full: ${JSON.stringify(record)}`);
+          continue;
+        }
+
+        // ── Market tick (tf = tick feed update) ───────────────────────────────
+        const tick = toTick(record, symbolByKey);
+        if (tick) {
+          tickCount++;
+          lastPayload = tick;
+          await onTick(tick);
+          if (!firstTickLoggedThisConnection) {
+            firstTickLoggedThisConnection = true;
+            console.log(`[Feed] First tick received since (re)connect — feed confirmed live for symbol=${tick.symbol}.`);
+          }
+        } else {
+          const exchange = record.e || record.exch || record.exchange;
+          const token = record.tk || record.token || record.instrumentToken;
+          const resolvedSymbol = symbolByKey.get(`${exchange}|${token}`) || symbolByKey.get(String(token));
+          if (resolvedSymbol) {
+            // Token is a known subscribed instrument, but this delta carries neither a
+            // price nor any previously-seen price to carry forward — i.e. an OI/volume
+            // update that arrived before the instrument's first trade of the day.
+            debugLog(`[Feed:OI-ONLY] ${resolvedSymbol} — delta with no price yet (pre-first-trade): ${JSON.stringify(record).substring(0, 200)}`);
+          } else {
+            // Truly unmapped token — not one of our subscribed instruments, or the
+            // exchange|token → symbol mapping is stale (e.g. after an expiry rollover).
+            debugLog(`[Feed:SKIP] Unrecognized record (t="${t ?? "(none)"}") e="${exchange ?? "(none)"}" tk="${token ?? "(none)"}": ${JSON.stringify(record).substring(0, 200)}`);
           }
         }
-        continue;
-      }
-
-      // ── Heartbeat / ping ───────────────────────────────────────────────────
-      if (t === "h") {
-        debugLog(`[Feed:PING] Heartbeat from Zebu (msg #${totalMsgCount})`);
-        continue;
-      }
-
-      // ── Broker-level error ─────────────────────────────────────────────────
-      if (record.s === "Not_Ok" || (record.emsg && !t)) {
-        console.error(`[Feed:ERROR] Broker error — emsg="${record.emsg ?? "(none)"}" | Full: ${JSON.stringify(record)}`);
-        continue;
-      }
-
-      // ── Market tick (tf = tick feed update) ───────────────────────────────
-      const tick = toTick(record, symbolByKey);
-      if (tick) {
-        tickCount++;
-        lastPayload = tick;
-        await onTick(tick);
-      } else {
-        const exchange = record.e || record.exch || record.exchange;
-        const token = record.tk || record.token || record.instrumentToken;
-        const resolvedSymbol = symbolByKey.get(`${exchange}|${token}`) || symbolByKey.get(String(token));
-        if (resolvedSymbol) {
-          // Token is a known subscribed instrument, but this delta carries neither a
-          // price nor any previously-seen price to carry forward — i.e. an OI/volume
-          // update that arrived before the instrument's first trade of the day.
-          debugLog(`[Feed:OI-ONLY] ${resolvedSymbol} — delta with no price yet (pre-first-trade): ${JSON.stringify(record).substring(0, 200)}`);
-        } else {
-          // Truly unmapped token — not one of our subscribed instruments, or the
-          // exchange|token → symbol mapping is stale (e.g. after an expiry rollover).
-          debugLog(`[Feed:SKIP] Unrecognized record (t="${t ?? "(none)"}") e="${exchange ?? "(none)"}" tk="${token ?? "(none)"}": ${JSON.stringify(record).substring(0, 200)}`);
-        }
+      } catch (err: any) {
+        // Never let one bad record take down the whole message handler (or the
+        // process, via an unhandled rejection) — log it and keep processing the
+        // remaining records in this same WebSocket message.
+        console.error(
+          `[Feed:ERROR] Unexpected exception while processing a market-data record — skipping this record only: ${err?.message || err}`,
+          record
+        );
       }
     }
   });
@@ -561,6 +731,7 @@ export const startZebuMarketDataFeedWithCredentials = (
   ws.on("close", () => {
     wsConnected = false;
     clearInterval(statsInterval);
+    clearInterval(idleWatchdogInterval);
     const reason = liveConnected ? "live feed closed" : "connection closed before handshake";
     console.log(`[Feed] Disconnected — ${reason}. Total messages received: ${totalMsgCount} | Total ticks: ${tickCount}`);
     onDataSource("SIMULATOR");
@@ -570,6 +741,7 @@ export const startZebuMarketDataFeedWithCredentials = (
   ws.on("error", (err) => {
     wsConnected = false;
     clearInterval(statsInterval);
+    clearInterval(idleWatchdogInterval);
     console.error("[Feed] WebSocket error:", err.message);
     onDataSource("SIMULATOR");
     onFallback("WebSocket error");
@@ -578,6 +750,7 @@ export const startZebuMarketDataFeedWithCredentials = (
   return {
     close: () => {
       clearInterval(statsInterval);
+      clearInterval(idleWatchdogInterval);
       ws.close();
     },
     subscribeTokens,

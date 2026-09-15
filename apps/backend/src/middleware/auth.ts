@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from "express";
 import { verifyAccessToken } from "../utils/token";
 import redis from "../config/redis";
+import { User } from "../models/User";
 
 // Custom request interface to append authenticated user context
 export interface AuthenticatedRequest extends Request {
@@ -89,5 +90,67 @@ export const authenticate = async (
   } catch (error: any) {
     console.error("[Auth Middleware Error]:", error?.message || error);
     return res.status(401).json({ error: "Invalid or expired access token.", detail: error?.message });
+  }
+};
+
+// ── Global market-data shutdown authorization ───────────────────────────────
+//
+// POST /api/system/market-data/shutdown stops Module 1 AND Module 2 for every
+// connected user. It previously required only `authenticate` — any logged-in
+// application user could trigger it. This gates it to a small, ops-configured
+// allowlist of admin usernames (env var, no schema/role migration required).
+//
+// Deliberately FAIL-CLOSED: an unset/empty allowlist denies everyone, rather
+// than defaulting to "any authenticated user" (the exact hole being closed
+// here). Ops must explicitly opt an admin username in.
+const parseUsernameAllowlist = (raw?: string): Set<string> =>
+  new Set((raw || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean));
+
+/** Pure decision function — no DB/network — so it can be unit tested directly
+ *  without a live MongoDB connection. The route middleware below is a thin
+ *  wrapper that resolves the caller's username and calls this. */
+export const isUsernameAuthorizedForMarketDataShutdown = (
+  username: string | null | undefined,
+  allowlistEnvValue: string | undefined = process.env.MARKET_DATA_SHUTDOWN_ADMIN_USERNAMES
+): boolean => {
+  const allowlist = parseUsernameAllowlist(allowlistEnvValue);
+  if (allowlist.size === 0) return false; // fail closed
+  if (!username) return false;
+  return allowlist.has(username.trim().toLowerCase());
+};
+
+export const requireMarketDataShutdownAdmin = async (
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) {
+      return res.status(401).json({ error: "Access denied. No authenticated user." });
+    }
+
+    const allowlistConfigured = parseUsernameAllowlist(process.env.MARKET_DATA_SHUTDOWN_ADMIN_USERNAMES).size > 0;
+    if (!allowlistConfigured) {
+      console.warn(
+        "[Auth Middleware] Global market-data shutdown blocked: MARKET_DATA_SHUTDOWN_ADMIN_USERNAMES is not configured (fail-closed)."
+      );
+      return res.status(403).json({ error: "Global market-data shutdown is not enabled for any user." });
+    }
+
+    const user = await User.findById(userId).select("username").lean();
+    const username = (user as any)?.username as string | undefined;
+
+    if (!isUsernameAuthorizedForMarketDataShutdown(username)) {
+      console.warn(
+        `[Auth Middleware] Unauthorized global market-data shutdown attempt — userId=${userId}${username ? ` username=${username}` : " (user not found)"}.`
+      );
+      return res.status(403).json({ error: "You are not authorized to perform a global market-data shutdown." });
+    }
+
+    next();
+  } catch (error: any) {
+    console.error("[Auth Middleware] requireMarketDataShutdownAdmin error:", error?.message || error);
+    return res.status(500).json({ error: "Authorization check failed." });
   }
 };

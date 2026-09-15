@@ -406,6 +406,22 @@ export const getActiveInstrumentTokens = async (options?: { force?: boolean }): 
 
 export const getCachedInstrumentTokens = (): ActiveInstrumentTokens | null => cachedTokens;
 
+/** Test-only: seed the in-memory cache so getActiveInstrumentTokens() resolves
+ *  instantly from cache instead of downloading the real NFO master over the
+ *  network. Does not change any selection/business logic — it only pre-fills
+ *  the same cache the real download path would have populated. */
+export const __setCachedInstrumentTokensForTest = (
+  tokens: ActiveInstrumentTokens,
+  rows: MasterRow[] = [{
+    exchange: "NFO", token: "0", symbol: "NIFTY", tradingSymbol: "NIFTY-TEST",
+    expiry: new Date(), strike: 0, optionType: "", instrumentType: "FUTIDX",
+  }]
+): void => {
+  cachedTokens = tokens;
+  cachedRows = rows;
+  lastFetchTime = Date.now();
+};
+
 // ── Dropdown discovery (Exchange → Instrument → Symbol → Expiry → Strike) ──────────────────────
 // Every function below is a straight pass-through filter over `cachedRows` — the broker's own
 // Exchange/Instrument/Symbol/Expiry/Strike fields, nothing inferred, curated, or hardcoded. Each

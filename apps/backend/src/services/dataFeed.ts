@@ -8,7 +8,7 @@ import redis from "../config/redis";
 import {
   startZebuMarketDataFeedWithCredentials, setRuntimeInstrumentTokens,
   parseInstrumentEnv, ZebuInstrument, isZebuLiveConnected,
-  clearDynamicSubscribedInstruments,
+  clearDynamicSubscribedInstruments, getModule1SubscriptionStats,
 } from "./zebuMarketDataClient";
 import { broadcastBrokerStatus, resetMarketReady } from "./socketService";
 import { getActiveInstrumentTokens, refreshInstrumentTokens, recomputeOptionBandFromLivePrice } from "./instrumentTokenService";
@@ -79,6 +79,31 @@ export const setOnTickReceived = (callback: TickCallback) => {
 
 // ── Reconnection state ────────────────────────────────────────────────────────
 
+/**
+ * Explicit Module 1 feed state, surfaced via getModule1FeedState()/getModule1FeedStats()
+ * for observability and tests:
+ *   STOPPED         — no credentials held; nothing to reconnect (initial state,
+ *                      after stopDataFeed()/global shutdown, or after a
+ *                      disconnect with no stored credentials).
+ *   CONNECTING      — a connection attempt (including the very first one) is
+ *                      in flight; the WS may or may not be open yet.
+ *   CONNECTED       — Zebu accepted the session (ck ack OK) and the initial
+ *                      subscribe was sent.
+ *   RECONNECTING    — a transient disconnect occurred and an automatic
+ *                      reconnect is scheduled with the same stored credentials.
+ *   SESSION_EXPIRED — Zebu explicitly rejected the session as invalid (or the
+ *                      same token was rejected repeatedly). Automatic
+ *                      reconnect is halted; a fresh broker login is required.
+ *   ERROR           — a non-retryable setup problem (e.g. missing WS URL
+ *                      configuration) — retrying without a config change
+ *                      cannot succeed, so automatic reconnect is halted.
+ */
+export type Module1FeedState =
+  | "STOPPED" | "CONNECTING" | "CONNECTED" | "RECONNECTING" | "SESSION_EXPIRED" | "ERROR";
+
+let feedState: Module1FeedState = "STOPPED";
+export const getModule1FeedState = (): Module1FeedState => feedState;
+
 let storedUserId: string | null = null;
 let storedSessionToken: string | null = null;
 let reconnectAttempts = 0;
@@ -92,12 +117,20 @@ let totalReconnects = 0;
 let lastDisconnectReason = "";
 let lastDisconnectAt = 0;
 
+// Reasons a disconnect callback can report that no amount of retrying with the
+// same process state will ever fix — e.g. missing environment configuration.
+// Automatic reconnect is deliberately NOT scheduled for these; the state
+// becomes ERROR instead of spinning "reconnecting" forever.
+const NON_RETRYABLE_DISCONNECT_REASONS = ["ZEBU_WS_URL not configured"];
+
 export const getModule1FeedStats = () => ({
   connected: isZebuLiveConnected(),
+  state: feedState,
   totalReconnects,
   reconnectAttempts,
   lastDisconnectReason,
   lastDisconnectAt,
+  ...getModule1SubscriptionStats(),
 });
 
 // Each call to startDataFeedWithCredentials / stopDataFeed increments this
@@ -128,12 +161,32 @@ const handleFeedDisconnect = (reason: string, gen: number) => {
 
   if (sessionExpired) return;
 
+  if (NON_RETRYABLE_DISCONNECT_REASONS.some((r) => reason.includes(r))) {
+    feedState = "ERROR";
+    clearReconnectTimer();
+    console.error(`[DataFeed] Non-retryable configuration problem — halting automatic reconnect: ${reason}`);
+    broadcastBrokerStatus("broker-disconnected", reason, "module1");
+    return;
+  }
+
   if (!storedUserId || !storedSessionToken) {
+    feedState = "STOPPED";
     console.warn("[DataFeed] No stored credentials — cannot reconnect.");
     broadcastBrokerStatus("broker-disconnected", reason, "module1");
     return;
   }
 
+  if (reconnectTimer) {
+    // A reconnect is already scheduled for this generation — e.g. both the
+    // WebSocket's 'close' and 'error' events fired for the same failure.
+    // Do not schedule a second timer (that would double-count attempts and
+    // could eventually run two overlapping reconnects) and do not re-broadcast
+    // "reconnecting" for the same, already-announced attempt.
+    console.log(`[DataFeed] Reconnect already scheduled (gen=${gen}) — ignoring duplicate disconnect signal, reason: ${reason}`);
+    return;
+  }
+
+  feedState = "RECONNECTING";
   // Resilient exponential backoff capped at 30 seconds for background recovery
   const delay = Math.min(30000, Math.round(RECONNECT_BASE_DELAY_MS * Math.pow(1.5, Math.min(reconnectAttempts, 10))));
   reconnectAttempts++;
@@ -142,6 +195,7 @@ const handleFeedDisconnect = (reason: string, gen: number) => {
   broadcastBrokerStatus("reconnecting", `Attempt #${reconnectAttempts}`, "module1");
 
   reconnectTimer = setTimeout(async () => {
+    reconnectTimer = null;
     if (!storedUserId || !storedSessionToken) return;
     if (gen !== connectionGeneration) return; // Superseded before timer fired
     await startDataFeedWithCredentials(storedUserId!, storedSessionToken!);
@@ -151,13 +205,36 @@ const handleFeedDisconnect = (reason: string, gen: number) => {
 const handleSessionExpired = (gen: number) => {
   if (gen !== connectionGeneration) return;
 
-  zebuClient = null;
+  // Set every guard BEFORE touching the socket: closing it can invoke this
+  // module's own "close" handler synchronously (depending on the WebSocket
+  // implementation), which re-enters handleFeedDisconnect. sessionExpired
+  // (and clearing the stored credentials) must already be in place so that
+  // re-entrant call is a guaranteed no-op rather than a race that schedules a
+  // pointless reconnect with the token we just declared dead.
   sessionExpired = true;
+  feedState = "SESSION_EXPIRED";
   storedUserId = null;
   storedSessionToken = null;
   clearReconnectTimer();
+
+  // Proactively close the now-useless socket instead of merely dropping our
+  // reference to it — otherwise it's left open (a leaked connection) until
+  // Zebu eventually closes it from its side.
+  const clientToClose = zebuClient;
+  zebuClient = null;
+  if (clientToClose) {
+    try { clientToClose.close(); } catch { /* best-effort */ }
+  }
+
   setModule1OiDataSource("SIMULATOR");
-  console.warn("[DataFeed] Broker session expired — user must re-authenticate.");
+  // The persisted (Redis) session mirrors the now-invalid in-memory token —
+  // without clearing it, the next auto-resume (e.g. triggered by a new
+  // frontend socket connecting while disconnected — see
+  // module1SessionService.ts) would read it back and immediately retry the
+  // SAME dead token, defeating the point of this state. A fresh broker login
+  // is the only thing that can legitimately produce a new, valid session.
+  clearPersistedBrokerSession();
+  console.warn("[DataFeed] Broker session marked INVALID by Zebu — halting automatic reconnect. Fresh broker login required.");
   broadcastBrokerStatus("session-expired", "Broker session expired. Please reconnect.", "module1");
 };
 
@@ -180,6 +257,7 @@ export const startDataFeedWithCredentials = async (userId: string, sessionToken:
   }
 
   isConnecting = true;
+  feedState = "CONNECTING";
   enableMarketDataProcessing();
   startBoundaryChecker();
 
@@ -248,9 +326,11 @@ export const startDataFeedWithCredentials = async (userId: string, sessionToken:
       () => {
         isConnecting = false;
         reconnectAttempts = 0;
-        // Called when the Zebu WebSocket actually connects and the handshake is sent.
-        // Only broadcast "live" at this point — not prematurely.
-        console.log("[DataFeed] Zebu WS open — broadcasting live status");
+        feedState = "CONNECTED";
+        // Called after Zebu's ck ack accepts the session AND the subscribe
+        // frames are sent (see zebuMarketDataClient.ts) — not merely once the
+        // socket opens. Only broadcast "live" at this point — not prematurely.
+        console.log("[DataFeed] Zebu session accepted and subscriptions sent — broadcasting live status");
         broadcastBrokerStatus("live", undefined, "module1");
       },
     );
@@ -267,6 +347,7 @@ export const stopDataFeed = (_force = false) => {
   // Invalidate any in-flight or pending disconnect callbacks
   connectionGeneration++;
   clearReconnectTimer();
+  feedState = "STOPPED";
   storedUserId = null;
   storedSessionToken = null;
   sessionExpired = false;
