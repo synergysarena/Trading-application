@@ -21,6 +21,7 @@ import {
   getModule2PersistenceMetrics,
 } from "./module2PersistenceService";
 import { isModule2TrackingMinuteAllowed } from "./module2MarketHours";
+import { debugLog } from "../utils/logger";
 
 // In-memory cache for active tracker sessions to avoid database load
 export const activeSessions: Record<string, Module2SessionData> = {};
@@ -824,7 +825,7 @@ const executeMinuteBoundary = async () => {
           ltpMissing,
         };
 
-        console.log(`[AGGREGATION][MINUTE] symbol=${strike} minute=${timeString} open=${strikeState.dayOpen} high=${strikeState.dayHigh} low=${strikeState.dayLow} close=${ltp}`);
+        debugLog(`[AGGREGATION][MINUTE] symbol=${strike} minute=${timeString} open=${strikeState.dayOpen} high=${strikeState.dayHigh} low=${strikeState.dayLow} close=${ltp}`);
 
         const existingCellIdx = strikeState.grid.findIndex((c) => c.minute === minutesSinceStart || c.timestamp === timeString);
         if (existingCellIdx >= 0) {
@@ -851,7 +852,7 @@ const executeMinuteBoundary = async () => {
         });
 
         // Broadcast to connected clients — IMMEDIATELY, independent of the DB.
-        console.log(`[SOCKET][BROADCAST] session=${sessionId} symbol=${strike} ltp=${ltp}`);
+        debugLog(`[SOCKET][BROADCAST] session=${sessionId} symbol=${strike} ltp=${ltp}`);
         broadcastTrackerUpdate(sessionId, {
           strike,
           cell,

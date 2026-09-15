@@ -12,6 +12,7 @@ import {
   removeModule1SessionBySocket,
   touchModule1Session,
 } from "./module1SessionService";
+import { debugLog } from "../utils/logger";
 
 let ioServer: Server | null = null;
 
@@ -241,7 +242,7 @@ export const initSocketServer = (io: Server) => {
       // Log socket emit stats every 100 emits
       if (_socketEmitCount % 100 === 0) {
         const connectedClients = ioServer.sockets.sockets.size;
-        console.log(`[Socket] Emit #${_socketEmitCount} | Event: latest-oi | Clients: ${connectedClients} | c_tl: ${oiMetrics.c_tl} | p_tl: ${oiMetrics.p_tl}`);
+        debugLog(`[Socket] Emit #${_socketEmitCount} | Event: latest-oi | Clients: ${connectedClients} | c_tl: ${oiMetrics.c_tl} | p_tl: ${oiMetrics.p_tl}`);
       }
     }
 

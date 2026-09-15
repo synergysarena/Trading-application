@@ -13,6 +13,7 @@ import {
 import { broadcastBrokerStatus, resetMarketReady } from "./socketService";
 import { getActiveInstrumentTokens, refreshInstrumentTokens, recomputeOptionBandFromLivePrice } from "./instrumentTokenService";
 import { isOhlcAuditEnabled, recordPipelineTick } from "./module1OhlcAudit";
+import { debugLog } from "../utils/logger";
 
 let zebuClient: { close: () => void; subscribeTokens?: (instruments: ZebuInstrument[]) => void } | null = null;
 
@@ -326,7 +327,7 @@ export const processIncomingTick = async (tick: Tick) => {
   }
 
   if (_totalTickCount % 100 === 0) {
-    console.log(`[Feed] Tick #${_totalTickCount} | symbol: ${symbol} ltp: ${ltp} oi: ${oi ?? "—"}`);
+    debugLog(`[Feed] Tick #${_totalTickCount} | symbol: ${symbol} ltp: ${ltp} oi: ${oi ?? "—"}`);
   }
 
   recordTickReceived();

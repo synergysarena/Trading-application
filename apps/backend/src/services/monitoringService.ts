@@ -3,6 +3,7 @@ import { isZebuLiveConnected } from "./zebuMarketDataClient";
 import { isAetramConnected, getActiveSubscribedInstruments } from "./aetramMarketDataService";
 import { getStatus as getWebSocketStatus } from "./marketDataWebSocketService";
 import { isMarketDataAuthenticated } from "./marketDataSessionService";
+import { debugLog } from "../utils/logger";
 
 let lastTickTimeModule1 = Date.now();
 let lastTickTimeModule2 = Date.now();
@@ -15,7 +16,7 @@ export const recordTickReceived = (moduleId: "module1" | "module2" = "module1") 
   const now = Date.now();
   if (moduleId === "module2") {
     lastTickTimeModule2 = now;
-    console.log(`[MODULE2][MONITOR] module2 lastTickAt updated: ${new Date(now).toISOString()}`);
+    debugLog(`[MODULE2][MONITOR] module2 lastTickAt updated: ${new Date(now).toISOString()}`);
   } else {
     lastTickTimeModule1 = now;
   }

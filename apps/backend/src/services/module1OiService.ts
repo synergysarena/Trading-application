@@ -1,5 +1,6 @@
 import { Tick } from "@stock/shared";
 import { readLive } from "./redisWriteBuffer";
+import { debugLog } from "../utils/logger";
 
 type OiSignal = "STRONG_BULL" | "MILD_BULL" | "NEUTRAL" | "MILD_BEAR" | "STRONG_BEAR" | "DIVERGENCE";
 
@@ -175,25 +176,25 @@ export const ingestModule1OiTick = (tick: Tick) => {
     _diagLastLogTime = now;
     const c_tl = Math.round(sumValues(ceOiBySymbol));
     const p_tl = Math.round(sumValues(peOiBySymbol));
-    console.log(
+    debugLog(
       `[Calc] OI Tick #${_diagTickCount} | CE symbols: ${ceOiBySymbol.size} | PE symbols: ${peOiBySymbol.size}` +
       ` | C_TL: ${c_tl} | P_TL: ${p_tl} | FUT OI: ${latestFuturesOi} | Rows: ${rows.length}`
     );
     // Log individual symbol OI to identify token classification issues
     if (ceOiBySymbol.size > 0) {
       const ceEntries = Array.from(ceOiBySymbol.entries()).map(([s, v]) => `${s}=${v}`).join(", ");
-      console.log(`[Calc] CE bucket: ${ceEntries}`);
+      debugLog(`[Calc] CE bucket: ${ceEntries}`);
     } else {
       console.warn("[Calc] WARNING: No CE OI data. Option tokens may be expired or not yet received.");
     }
     if (peOiBySymbol.size > 0) {
       const peEntries = Array.from(peOiBySymbol.entries()).map(([s, v]) => `${s}=${v}`).join(", ");
-      console.log(`[Calc] PE bucket: ${peEntries}`);
+      debugLog(`[Calc] PE bucket: ${peEntries}`);
     } else {
       console.warn("[Calc] WARNING: No PE OI data. Option tokens may be expired or not yet received.");
     }
     if (latestRow) {
-      console.log(`[Calc] Latest Row: time=${latestRow.timestamp} c_tl=${latestRow.c_tl} c_buy=${latestRow.c_buy} c_sell=${latestRow.c_sell} p_tl=${latestRow.p_tl} signal=${latestRow.callSignal}`);
+      debugLog(`[Calc] Latest Row: time=${latestRow.timestamp} c_tl=${latestRow.c_tl} c_buy=${latestRow.c_buy} c_sell=${latestRow.c_sell} p_tl=${latestRow.p_tl} signal=${latestRow.callSignal}`);
     }
   }
 };

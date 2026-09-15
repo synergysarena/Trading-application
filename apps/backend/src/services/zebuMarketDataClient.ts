@@ -1,6 +1,7 @@
 import WebSocket from "ws";
 import { Tick } from "@stock/shared";
 import { getZebuOAuthMissingConfig, resolveZebuSessionToken } from "./zebuOAuthService";
+import { debugLog } from "../utils/logger";
 
 type DataSource = "LIVE_MARKET_API" | "SIMULATOR";
 
@@ -155,7 +156,7 @@ const logDiagnosticTick = (payload: any, tick: Tick) => {
 
   if (isFut && diagFutTickCount < MAX_DIAG_TICKS) {
     diagFutTickCount++;
-    console.log(
+    debugLog(
       `[ZEBU TICK DIAG][FUT #${diagFutTickCount}/${MAX_DIAG_TICKS}] ` +
       `symbol=${tick.symbol} ltp=${tick.ltp} rawLtp=${payload.lp ?? payload.ltp ?? "—"} ` +
       `rawO=${payload.o ?? "—"} rawH=${payload.h ?? "—"} rawL=${payload.l ?? "—"} rawC=${payload.c ?? "—"} ` +
@@ -163,7 +164,7 @@ const logDiagnosticTick = (payload: any, tick: Tick) => {
     );
   } else if (isSpot && diagSpotTickCount < MAX_DIAG_TICKS) {
     diagSpotTickCount++;
-    console.log(
+    debugLog(
       `[ZEBU TICK DIAG][SPOT #${diagSpotTickCount}/${MAX_DIAG_TICKS}] ` +
       `symbol=${tick.symbol} ltp=${tick.ltp} rawLtp=${payload.lp ?? payload.ltp ?? "—"} ` +
       `rawO=${payload.o ?? "—"} rawH=${payload.h ?? "—"} rawL=${payload.l ?? "—"} rawC=${payload.c ?? "—"} ` +
@@ -390,9 +391,9 @@ export const startZebuMarketDataFeedWithCredentials = (
   let msgCountThisMinute = 0;
   let totalMsgCount = 0;
   const statsInterval = setInterval(() => {
-    console.log(`[Feed:STATS] Messages/min: ${msgCountThisMinute} | Total messages: ${totalMsgCount} | Ticks: ${tickCount} | Instruments: ${instruments.length}`);
+    debugLog(`[Feed:STATS] Messages/min: ${msgCountThisMinute} | Total messages: ${totalMsgCount} | Ticks: ${tickCount} | Instruments: ${instruments.length}`);
     if (lastPayload) {
-      console.log(`[Feed:STATS] Last tick — symbol=${lastPayload.symbol} ltp=${lastPayload.ltp} oi=${lastPayload.oi ?? "—"} ts=${lastPayload.timestamp?.toISOString?.() ?? "—"}`);
+      debugLog(`[Feed:STATS] Last tick — symbol=${lastPayload.symbol} ltp=${lastPayload.ltp} oi=${lastPayload.oi ?? "—"} ts=${lastPayload.timestamp?.toISOString?.() ?? "—"}`);
     } else {
       console.warn("[Feed:STATS] No ticks received yet — waiting for Zebu to stream data.");
     }
@@ -512,10 +513,10 @@ export const startZebuMarketDataFeedWithCredentials = (
             tickCount++;
             lastPayload = tick;
             await onTick(tick);
-            console.log(`[Feed:SNAP] Initial snapshot — ${tick.symbol} ltp=${tick.ltp} oi=${tick.oi ?? "—"}`);
+            debugLog(`[Feed:SNAP] Initial snapshot — ${tick.symbol} ltp=${tick.ltp} oi=${tick.oi ?? "—"}`);
           } else {
             // Pre-market or no LTP yet — instrument confirmed but price pending
-            console.log(`[Feed:SNAP] tk received (no price yet) — tk="${record.tk || "(none)"}" e="${record.e || "(none)"}" ts="${record.ts || "(none)"}"`);
+            debugLog(`[Feed:SNAP] tk received (no price yet) — tk="${record.tk || "(none)"}" e="${record.e || "(none)"}" ts="${record.ts || "(none)"}"`);
           }
         }
         continue;
@@ -523,7 +524,7 @@ export const startZebuMarketDataFeedWithCredentials = (
 
       // ── Heartbeat / ping ───────────────────────────────────────────────────
       if (t === "h") {
-        console.log(`[Feed:PING] Heartbeat from Zebu (msg #${totalMsgCount})`);
+        debugLog(`[Feed:PING] Heartbeat from Zebu (msg #${totalMsgCount})`);
         continue;
       }
 
@@ -547,11 +548,11 @@ export const startZebuMarketDataFeedWithCredentials = (
           // Token is a known subscribed instrument, but this delta carries neither a
           // price nor any previously-seen price to carry forward — i.e. an OI/volume
           // update that arrived before the instrument's first trade of the day.
-          console.log(`[Feed:OI-ONLY] ${resolvedSymbol} — delta with no price yet (pre-first-trade): ${JSON.stringify(record).substring(0, 200)}`);
+          debugLog(`[Feed:OI-ONLY] ${resolvedSymbol} — delta with no price yet (pre-first-trade): ${JSON.stringify(record).substring(0, 200)}`);
         } else {
           // Truly unmapped token — not one of our subscribed instruments, or the
           // exchange|token → symbol mapping is stale (e.g. after an expiry rollover).
-          console.log(`[Feed:SKIP] Unrecognized record (t="${t ?? "(none)"}") e="${exchange ?? "(none)"}" tk="${token ?? "(none)"}": ${JSON.stringify(record).substring(0, 200)}`);
+          debugLog(`[Feed:SKIP] Unrecognized record (t="${t ?? "(none)"}") e="${exchange ?? "(none)"}" tk="${token ?? "(none)"}": ${JSON.stringify(record).substring(0, 200)}`);
         }
       }
     }

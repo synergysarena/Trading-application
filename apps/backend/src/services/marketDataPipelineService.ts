@@ -1,4 +1,5 @@
 import { marketDataEvents } from "./marketDataEvents";
+import { debugLog } from "../utils/logger";
 
 /**
  * Market Data Pipeline (Phase 7).
@@ -254,9 +255,9 @@ export const processRawPacket = (packetType: string, raw: unknown): void => {
       lastTickCache.set(event.exchangeInstrumentID!, tickKey);
 
       if (event.lastPrice === 0) {
-        console.log(`[PIPELINE][ZERO_LTP] token=${event.exchangeInstrumentID} rawPayload=${JSON.stringify(payload)}`);
+        debugLog(`[PIPELINE][ZERO_LTP] token=${event.exchangeInstrumentID} rawPayload=${JSON.stringify(payload)}`);
       } else {
-        console.log(`[PIPELINE][NORMALIZED] token=${event.exchangeInstrumentID} lastPrice=${event.lastPrice}`);
+        debugLog(`[PIPELINE][NORMALIZED] token=${event.exchangeInstrumentID} lastPrice=${event.lastPrice}`);
       }
       marketDataEvents.emit("LTP_UPDATED", event);
     }

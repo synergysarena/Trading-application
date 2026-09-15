@@ -16,7 +16,7 @@ import { mongoConnectionStateName } from "../config/db";
 // ─────────────────────────────────────────────────────────────────────────────
 
 const SAMPLE_INTERVAL_MS = 15_000;
-const HEALTHY_INTERVAL_MS = 60_000;
+const HEALTHY_INTERVAL_MS = 5 * 60_000;
 const ALERT_MIN_GAP_MS = 15_000;
 
 // Thresholds that flip the line from heartbeat → alert.

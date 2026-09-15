@@ -38,6 +38,7 @@ import { initCandleArchive } from "./services/candleArchiveService";
 import { initMarketBroadcast } from "./services/marketBroadcastService";
 import { initModule1OiService } from "./services/module1OiService";
 import { startMonitoringLoop, stopMonitoringLoop, getMonitoringStatus } from "./services/monitoringService";
+import { startHealthSummaryLogger, stopHealthSummaryLogger } from "./services/healthSummaryService";
 import { stopDataFeed } from "./services/dataFeed";
 import { stopSessionManager } from "./services/module1SessionService";
 
@@ -366,6 +367,7 @@ const startServer = async () => {
   // ── Step 4: Start monitoring ──────────────────────────────────────────────
   startMonitoringLoop();
   startModule1PersistHealthLogger();
+  startHealthSummaryLogger();
 
   // ── Step 5: Start HTTP + WebSocket server ────────────────────────────────
   server.listen(PORT, () => {
@@ -409,6 +411,7 @@ const shutdown = (signal: string) => {
     console.log("[Server] HTTP server closed.");
     stopMonitoringLoop();
     stopModule1PersistHealthLogger();
+    stopHealthSummaryLogger();
     stopPivotWorker();
     stopSessionManager();
     stopDataFeed(true);

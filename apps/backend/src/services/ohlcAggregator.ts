@@ -5,6 +5,7 @@ import { archiveModule1Candles } from "./module1ArchiveService";
 import { isMarketDataProcessingEnabled } from "./marketDataLifecycle";
 import { isOhlcAuditEnabled, auditLog, getPipelineMinute } from "./module1OhlcAudit";
 import { mongoConnectionStateName } from "../config/db";
+import { debugLog } from "../utils/logger";
 
 /**
  * Grace period applied to TIMER-based (proactive) candle finalization only.
@@ -103,7 +104,7 @@ export const startBoundaryChecker = () => {
         // boundary still finalizes it immediately (see aggregateOHLC).
         if (now >= nextBoundary + PROACTIVE_FINALIZE_GRACE_MS) {
           if (!isMarketDataProcessingEnabled()) return;
-          console.log(`[MODULE1][BOUNDARY] Proactive finalization for ${symbol} (${tfStr}) at ${new Date(candle.openTime).toISOString()}.`);
+          debugLog(`[MODULE1][BOUNDARY] Proactive finalization for ${symbol} (${tfStr}) at ${new Date(candle.openTime).toISOString()}.`);
           const candleToFinalize = candle;
           delete activeCandles[symbol][tfStr];
           if (!lastKnownClose[symbol]) lastKnownClose[symbol] = {};
@@ -178,7 +179,7 @@ export const fillContinuityCandles = async (now: number, sessionOpenMs: number):
           isSynthetic: true,
         };
 
-        console.log(`[MODULE1][BOUNDARY] Generated synthetic carry-forward candle for ${symbol} (${tfStr}) at ${new Date(b).toISOString()} (close=${prevClose}).`);
+        debugLog(`[MODULE1][BOUNDARY] Generated synthetic carry-forward candle for ${symbol} (${tfStr}) at ${new Date(b).toISOString()} (close=${prevClose}).`);
         await finaliseCandle(syntheticCandle);
         filled++;
       }
@@ -317,7 +318,7 @@ export const aggregateOHLC = async (tick: Tick, timeframeMinutes: number, timefr
     fin.high = newHigh;
     fin.low = newLow;
     fin.volume += volume;
-    console.log(`[MODULE1][AGGREGATOR] Late real tick merged into finalized ${symbol} (${timeframeStr}) at ${new Date(boundary).toISOString()} — H/L extended to ${fin.high}/${fin.low}.`);
+    debugLog(`[MODULE1][AGGREGATOR] Late real tick merged into finalized ${symbol} (${timeframeStr}) at ${new Date(boundary).toISOString()} — H/L extended to ${fin.high}/${fin.low}.`);
     queueForPersist({ ...fin });
     return fin;
   };
@@ -337,7 +338,7 @@ export const aggregateOHLC = async (tick: Tick, timeframeMinutes: number, timefr
       syn.close = ltp;
       syn.volume = volume;
       syn.isSynthetic = false;
-      console.log(`[MODULE1][AGGREGATOR] Real tick arrived for synthetic candle ${symbol} (${timeframeStr}) at ${new Date(boundary).toISOString()} — replaced synthetic bar.`);
+      debugLog(`[MODULE1][AGGREGATOR] Real tick arrived for synthetic candle ${symbol} (${timeframeStr}) at ${new Date(boundary).toISOString()} — replaced synthetic bar.`);
       candleAudit.set(syn, { ticks: 1, prices: new Set([ltp]), first: ltp, last: ltp });
       queueForPersist({ ...syn });
       candle = syn;
@@ -394,7 +395,7 @@ export const aggregateOHLC = async (tick: Tick, timeframeMinutes: number, timefr
       syn.close = ltp;
       syn.volume = volume;
       syn.isSynthetic = false;
-      console.log(`[MODULE1][AGGREGATOR] Late real tick arrived for synthetic candle ${symbol} (${timeframeStr}) at ${new Date(boundary).toISOString()} — replaced synthetic bar.`);
+      debugLog(`[MODULE1][AGGREGATOR] Late real tick arrived for synthetic candle ${symbol} (${timeframeStr}) at ${new Date(boundary).toISOString()} — replaced synthetic bar.`);
       queueForPersist({ ...syn });
       return syn;
     }
@@ -413,7 +414,7 @@ export const aggregateOHLC = async (tick: Tick, timeframeMinutes: number, timefr
   // Diagnostic logger for 1m interval verification
   if (timeframeStr === "1m" && (symbol === "NIFTY-FUT" || symbol === "NIFTY-SPOT") && diagOhlc1mCount < MAX_DIAG_OHLC) {
     diagOhlc1mCount++;
-    console.log(
+    debugLog(
       `[MODULE1][TICK][1m #${diagOhlc1mCount}] symbol=${symbol} min=${new Date(boundary).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: false })} ` +
       `tick=${ltp} -> O=${candle.open} H=${candle.high} L=${candle.low} C=${candle.close} vol=${candle.volume}`
     );
@@ -589,7 +590,7 @@ const drainPersistQueue = async () => {
         _lastWriteMs = Date.now() - t0;
         persistQueue.splice(0, items.length);
         _persistOkCount += batch.length;
-        console.log(`[MODULE1][PERSIST] Persisted ${batch.length} candle(s) (${_lastWriteMs}ms, queue=${persistQueue.length}).`);
+        debugLog(`[MODULE1][PERSIST] Persisted ${batch.length} candle(s) (${_lastWriteMs}ms, queue=${persistQueue.length}).`);
         enqueuePivotsFor(batch);
       } catch (error: any) {
         _lastWriteMs = Date.now() - t0;
@@ -602,7 +603,7 @@ const drainPersistQueue = async () => {
           // Every op was a duplicate key → the documents are already persisted.
           persistQueue.splice(0, items.length);
           _persistOkCount += batch.length;
-          console.log(`[MODULE1][PERSIST] Batch of ${batch.length} already present (duplicate-key) — treated as persisted.`);
+          debugLog(`[MODULE1][PERSIST] Batch of ${batch.length} already present (duplicate-key) — treated as persisted.`);
           enqueuePivotsFor(batch);
           continue;
         }
@@ -715,7 +716,7 @@ const finaliseCandle = async (liveCandle: Candle) => {
       finalizedCandlesCache[symbol][timeframe][existingIdx] = merged;
       candle = merged;
       if (changed) {
-        console.log(`[MODULE1][AGGREGATOR] Re-finalization merged into existing real candle ${symbol} (${timeframe}) at ${new Date(candle.openTime).toISOString()} — O/H/L/C=${candle.open}/${candle.high}/${candle.low}/${candle.close}.`);
+        debugLog(`[MODULE1][AGGREGATOR] Re-finalization merged into existing real candle ${symbol} (${timeframe}) at ${new Date(candle.openTime).toISOString()} — O/H/L/C=${candle.open}/${candle.high}/${candle.low}/${candle.close}.`);
       }
     } else {
       // Existing synthetic (or new real replacing synthetic) — replace outright.
